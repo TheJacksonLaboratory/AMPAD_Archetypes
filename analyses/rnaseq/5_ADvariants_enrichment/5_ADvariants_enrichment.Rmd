@@ -1,0 +1,264 @@
+---
+title: "association between AD-related variants and archetypes in ROSMAP"
+author: "Annat Haber"
+date: '`r Sys.Date()`'
+output:
+  html_document:
+    toc: true
+    code_folding: hide
+---
+http://www.sthda.com/english/articles/31-principal-component-methods-in-r-practical-guide/114-mca-multiple-correspondence-analysis-in-r-essentials/
+
+```{r setup, warning=FALSE, message=FALSE}
+knitr::opts_knit$set(root.dir = rprojroot::find_rstudio_root_file())
+knitr::opts_chunk$set(cache=TRUE, cache.extra = R.version)
+```
+
+```{r libraries, warning=FALSE, message=FALSE}
+suppressPackageStartupMessages({
+  library(FactoMineR)
+  library(factoextra)
+  library(tidyverse)
+  library(vcd)
+  library(lattice)
+})
+
+```
+
+# Input
+```{r inupt}
+# Loading variants information: this table was constructed manually based on the literature as well as the amp-ad annotation files
+variants <- read.delim("data/ADvariants_anno.txt", colClasses = "character")
+rownames(variants) <- variants$ID
+
+# Loading genotype information extracted from amp-ad wgs files (joint calling for the three cohorts)
+genotypes <- read.csv("data/ADvariants_genotypes.csv", colClasses = "character")
+colnames(genotypes) <- paste(variants[colnames(genotypes), "ClosestGene"], colnames(genotypes), sep="_")
+genotypes$wgs_id <- rownames(genotypes)
+
+# Loading commbined genotype for APOE4 extracted from amp-ad wgs files (joint calling for the three cohorts)
+apoe4 <- read.csv("data/ApoE.all.csv", colClasses = "character") %>%
+  select("wgs_id"=WGS_SampleID, "APOE_e4"=apoe_wgs)
+
+apoe4$APOE_e4 <- ifelse(apoe4$APOE_e4=="44", "2", ifelse(apoe4$APOE_e4=="22", "0", "1"))
+genotypes <- merge(apoe4, genotypes, by="wgs_id", all=TRUE)
+
+archetypes <- readRDS("analyses/rnaseq/1_fit_archetypes/archetypes_meta_AD_k3p20.RDS") %>%
+  select(wgs_id, archetype) %>%
+  filter(!is.na(wgs_id))
+
+data <- merge(genotypes, archetypes, by="wgs_id", all=FALSE)
+
+longdata <- data %>%
+  pivot_longer(-c("wgs_id","archetype"),  names_to="variant", values_to = "genotype")
+```
+
+# Distributions {.tabset .tabset-fade .tabset-pills}
+
+## Genotypes total frequencies
+This graph is mostly to see if any of the genotypes have very low frequncies, which could bias the chi-2 values and CA.
+IL34, SCIMP, APOE, and SHARPIN have very low frequencies for genotype 2, and therefore should be deleted or pooled.  
+Below I repeated the analysis with and without these genes pooled and unpooled.
+```{r genotypeFreq}
+df <- longdata %>%
+  count(variant, genotype)
+
+ggplot(df, aes( x = genotype, y = n) ) + 
+      geom_bar( stat = "identity") + 
+      facet_wrap( ~ variant ) + 
+      geom_text( aes( label = n, y = n+200 ),
+                 vjust = 1.4, size = 3, color = "black" ) +
+      theme_bw()
+
+delvar <- df$variant[df$n < 10]
+```
+
+
+## Genotype frequencies by archetype
+This graph is mostly to see if any of the categories have very low frequncies when split by archetype, which could bias MCA.
+ADAMTS4 and AP4E/SPPL2A have somewhat low frequencies for genotype 2.
+```{r genotypeArchetypeFreq}
+df <- longdata %>%
+  count(archetype, variant, genotype)
+
+ggplot(df, aes( x = archetype, y = n, fill=genotype) ) + 
+      geom_bar( stat = "identity", position="dodge" ) + 
+      facet_wrap( ~ variant ) + 
+      theme_bw()+ 
+      theme( axis.text.x = element_text( angle = 90,  hjust = 1 ) )
+
+```
+
+## Chi-square deviations genotype-by-archetype {.tabset .tabset-fade .tabset-pills}
+Chi-square deviations of genotype by archetype are calculated for each variant independently.  
+All deviations are very low (between -2 and 2), indicacting no associations all in all.  
+SPI1_rs1377416 is the only variant that is almost significantly associated with archetypes. SCIMP is significant but might be biased due to low frequencies.
+
+### Unpooled genotypes
+```{r genotypeArchetypeChi2dev, out.width=c('33%', '33%', '33%'), fig.show='hold', out.extra='style="background-color: #9ecff7; padding:1px; display: inline-block;"'}
+df <- longdata %>%
+  count(archetype, variant, genotype)
+
+df$chi2dev <- NA
+vars <- unique(df$variant)
+
+for (var in vars) {
+  dfv <- df %>%
+    filter(variant==var) %>%
+    select(-c("variant", "chi2dev")) %>%
+    pivot_wider(names_from = genotype, values_from = n) %>%
+    column_to_rownames("archetype")
+  
+  assoc(as.matrix(dfv), main=var, shade=TRUE, 
+        labeling_args = list(gp_labels = gpar(fontsize = 15), abbreviate_labs = c(6, 9), 
+                             varnames=c(FALSE,FALSE), rot_labels=c(0,0)))
+  }
+
+
+```
+
+### Pooled genotypes
+Pooling genotypes 1+2 for these genes:ADAMTS4, AP4E1/SPPL2A, IL34, SCIMP, SHARPIN
+```{r genotypeArchetypeChi2dev_pooled, out.width=c('33%', '33%', '33%'), fig.show='hold', out.extra='style="background-color: #9ecff7; padding:1px; display: inline-block;"'}
+df <- longdata %>%
+  count(archetype, variant, genotype)
+
+pooled <- c("ADAMTS4_rs4575098", "AP4E1/SPPL2A_rs12595082", "IL34_rs4985556", "SCIMP_rs61481506", "SHARPIN_rs34674752")
+
+df$chi2dev <- NA
+
+vars <- unique(df$variant)
+for (var in vars) {
+  dfv <- df %>%
+    filter(variant==var) %>%
+    select(-c("variant", "chi2dev")) %>%
+    pivot_wider(names_from = genotype, values_from = n) 
+  
+  if(var%in%pooled) {
+    dfv <- dfv %>%
+      mutate("1+2"= dfv$'1'+dfv$'2') %>%
+      select(archetype, "0","1+2")
+    }
+  dfv <- dfv %>%
+    column_to_rownames("archetype")
+  
+  assoc(as.matrix(dfv), main=var, shade=TRUE, 
+        labeling_args = list(gp_labels = gpar(fontsize = 15), abbreviate_labs = c(5, 9), varnames=c(FALSE,FALSE), rot_labels=c(0,0)))
+  }
+
+
+```
+
+# Multiple Correspondence Analysis {.tabset .tabset-fade .tabset-pills}
+Exploring associations between variants and archetypes with Correspondence analysis.  
+The space is based on variants only and therefore reperesents co-occurance among AD-related genotypes. 
+Screeplot indicates that there isn't much structure in the data, i.e., variant genotypes do not co-occur much more than expected by chance.  
+The two variants of BIN1 dominate the first and second axes.  
+Individuals are colored by archetype, indicating that there is no clear separation by archetypes in terms of their genotypes at these AD-related loci. Individuals assigned to archetype_3 correspond slightly with the groups of genes that includes BIN1 hets, CD2AP hets, OAS1 (0), and AP4E1/SPPL2A (1+2), and SHARPIN (1+2). Archetype_1 corresponds slightly with BIN1 reference homozygotes (0), IL34 effect allele homozygotes (2), SCIMP (1+2), PILRA (1), and EPHA1 (1).
+
+## Unpooled genotypes
+```{r mca, out.width=c('50%', '50%'), results="hold", fig.show="hold", out.extra='style="background-color: #9ecff7; padding:1px; display: inline-block;"'}
+ca.df <- data %>%
+  #select(-APOE_e4) %>%
+  column_to_rownames("wgs_id")
+
+# removing rsIDs from var names for plot; modifying gene names that have more than one variant
+colnm <- str_extract(colnames(ca.df), "^[^_]+")
+dupi <- which(duplicated(colnm) | duplicated(colnm,fromLast = T))
+cnx <- str_extract(colnames(ca.df)[dupi], "\\d\\d$")
+colnm[dupi] <- paste(colnm[dupi], cnx, sep="_")
+colnames(ca.df) <- colnm
+
+res.mca <- MCA(ca.df, quali.sup=grep("archetype", colnames(ca.df)), graph=FALSE)
+
+fviz_eig(res.mca, ncp=20)
+fviz_cos2(res.mca, choice = "var", axes = c(1,2), top = 15)
+fviz_contrib(res.mca, choice = "var", axes = 2, top = 15)
+fviz_contrib(res.mca, choice = "var", axes = 1, top = 15)
+
+fviz_mca_biplot(res.mca, axes = c(1,2),
+             label = "var", repel=TRUE,
+             habillage = "archetype", # color by archetype 
+             select.var = list(contrib = 10),
+             arrows = c(FALSE, TRUE),
+             ggtheme = theme_minimal(), 
+               ) 
+
+fviz_mca_biplot(res.mca, axes = c(3,4),
+             label = "var", repel=TRUE,
+             habillage = "archetype", # color by archetype 
+             select.var = list(contrib = 10),
+             arrows = c(FALSE, TRUE),
+             ggtheme = theme_minimal(), 
+               ) 
+
+fviz_mca_biplot(res.mca, axes = c(1,2),
+             label = c("var", "quali.sup"), repel=TRUE,
+             arrows = c(FALSE, TRUE),
+             map="rowprincipal",
+             ggtheme = theme_minimal(), 
+             invisible="ind"
+               ) 
+
+```
+
+## Pooled genotypes
+Removing APOE because it cannot be pooled.  
+Pooling genotypes 1+2 for theese genes:ADAMTS4, AP4E1/SPPL2A, IL34, SCIMP, SHARPIN
+```{r mca_pooled, out.width=c('50%', '50%'), results="hold", fig.show="hold", out.extra='style="background-color: #9ecff7; padding:1px; display: inline-block;"'}
+
+pooled <- c("ADAMTS4_rs4575098", "AP4E1/SPPL2A_rs12595082", "IL34_rs4985556", "SCIMP_rs61481506", "SHARPIN_rs34674752")
+
+ca.df <- data %>%
+  select(-APOE_e4) %>%
+  mutate_at(pooled, 
+            function(x) {replace(x, which(x=="1" | x=="2"), "1+2")}) %>%
+  column_to_rownames("wgs_id")
+
+# removing rsIDs from var names for plot
+# genes that have more than one variant are appended with the last two digits of the rsIDs
+colnm <- str_extract(colnames(ca.df), "^[^_]+")
+dupi <- which(duplicated(colnm) | duplicated(colnm,fromLast = T))
+cnx <- str_extract(colnames(ca.df)[dupi], "\\d\\d$")
+colnm[dupi] <- paste(colnm[dupi], cnx, sep="_")
+colnames(ca.df) <- colnm
+
+
+# MCA
+res.mca <- MCA(ca.df, quali.sup=grep("archetype", colnames(ca.df)), graph=FALSE)
+
+fviz_eig(res.mca, ncp=20)
+fviz_cos2(res.mca, choice = "var", axes = c(1,2), top = 15)
+fviz_contrib(res.mca, choice = "var", axes = 2, top = 15)
+fviz_contrib(res.mca, choice = "var", axes = 1, top = 15)
+
+fviz_mca_biplot(res.mca, axes = c(1,2),
+             label = "var", repel=TRUE,
+             habillage = "archetype", # color by archetype 
+             select.var = list(contrib = 10),
+             arrows = c(FALSE, TRUE),
+             ggtheme = theme_minimal(), 
+               ) 
+
+fviz_mca_biplot(res.mca, axes = c(3,4),
+             label = "var", repel=TRUE,
+             habillage = "archetype", # color by archetype 
+             select.var = list(contrib = 10),
+             arrows = c(FALSE, TRUE),
+             ggtheme = theme_minimal(), 
+               ) 
+
+fviz_mca_biplot(res.mca, axes = c(1,2),
+             label = c("var", "quali.sup"), repel=TRUE,
+             arrows = c(FALSE, TRUE),
+             ggtheme = theme_minimal(), 
+             invisible="ind"
+               ) 
+
+```
+
+
+# Session info
+```{r session-info, eval=FALSE}
+devtools::session_info()
+```

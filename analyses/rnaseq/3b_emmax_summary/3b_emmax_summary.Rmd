@@ -1,0 +1,115 @@
+---
+title: "Analyze EMMAX Results"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+knitr::opts_knit$set(root.dir = rprojroot::find_rstudio_root_file())
+
+library(gwasrapidd)
+library(tidyverse)
+library(ggplot2)
+library(data.table)
+
+```
+
+```{r load_data}
+source("scripts/utils/manhattan_plot.R")
+# All files ending in .ps (EMMAX association output)
+files <- list.files(path="output/emmax/", pattern="\\.ps$")
+```
+
+Q-Q Plots and Manhattan Plots
+-----------------------------
+
+Q-Q plots to check if there is any effect of population substructure on the results, and genomic inflation factor (lambda).
+
+Manhattan plots were generated for all SNPs that had a significant association (p < 0.05).
+
+filtering SNPs that were not genome-wide suggestive (p >= 1e-05) to identify genes that were close to the suggestive SNPs.
+
+```{r}
+for (file in files) {
+  
+  cat("Processing", file, "\n")
+  
+  gwas.results <- fread(paste0("output/emmax/", file), sep="\t", header=F)
+  colnames(gwas.results) <- c("SNP", "Beta", "Beta.SE", "P")
+  
+  # Calculate genomic inflation factor
+  chisq <- qchisq(1 - gwas.results[["P"]], 1)
+  lambda <- median(chisq) / qchisq(0.5, 1)
+  cat("\t", "Genomic Inflation Factor:", lambda, "\n")
+
+  # QQ Plot
+  plot.data <- data.frame(
+    Observed.Log.10.P=-log10(sort(gwas.results[["P"]])),
+    Expected.Log.10.P=-log10(1:nrow(gwas.results) / (nrow(gwas.results) + 1))
+  )
+  p <- ggplot(plot.data) +
+    geom_point(aes(x=Expected.Log.10.P, y=Observed.Log.10.P), size=I(0.75), alpha=0.5) +
+    geom_line(aes(x=Expected.Log.10.P, y=Expected.Log.10.P)) +
+    labs(x="Expected -log10(P)", y="Observed -log10(P)") +
+    annotate("text", x=6, y=1, label=paste0("λ=", round(lambda, 5))) +
+    basic_theme_big
+
+  ggsave(paste0("output/emmax/", strsplit(file, "\\.")[[1]][1], "_qqplot.png"), p, width=8, height=8)
+  
+  # Filter out all non-significant SNPs (p >= 0.05)
+  gwas.results <- as.data.frame(gwas.results[gwas.results[["P"]] < 0.05,])
+  
+  # Mutate to match manhattan plot helper function requirements
+  chr.bp <- do.call(rbind, strsplit(gwas.results$SNP, ":"))
+  gwas.results$CHR = as.numeric(chr.bp[,1])
+  gwas.results$BP = as.numeric(chr.bp[,2])
+
+  # Manhattan Plot
+  q <- manhattan.plot(gwas.results)
+  ggsave(paste0("output/emmax/", strsplit(file, "\\.")[[1]][1], "_manhattan.png"), q, width=15, height=6)
+
+  # Filter to suggestive SNPs (p < 1e-05)
+  gwas.results <- gwas.results %>%
+    dplyr::filter(P < 1e-05) %>%
+    dplyr::select(CHRBP=SNP, CHR, BP, Beta, Beta.SE, P) # changed header for "SNP" to match FUMA
+  
+  write.table(gwas.results, paste0("output/emmax/", strsplit(file, "\\.")[[1]][1], "_suggestive_snps.tsv"), row.names=F, quote=F, sep="\t")
+}
+```
+
+Annotations
+-----------
+
+Variants were annotated using FUMA's SNP2GENE and GENE2FUNC functions (https://fuma.ctglab.nl/).
+Resulting files, including parameter configurations, are in output/2b_emmax_summary/FUMA_archetype_*
+Minimum P-value of lead SNPs was changed to 1^-5
+sample size 562
+Otherwise all parameters were set to default.
+Main observation: 13-22 top genes. Not very related to brain function. Maybe to connective tissues and circulation 
+
+
+GWAS Catalog
+-------------
+Quarying NHGRI-EBI Gwas Cataloue for published associations of mapped variants.
+```{r, gwascatalog, warning=FALSE, error=FALSE}
+phenotypes <- c("archetype_1", "archetype_2", "archetype_3", "archetype")
+pubs <- c()
+for (ph in phenotypes) {
+  fuma <- read_tsv(paste0("./output/3b_emmax_summary/FUMA_", ph, "/snps.txt"))
+  variants <- fuma$rsID
+  for (var in variants) {
+    st <- get_studies(variant_id=var)
+    if (length(st@studies$study_id)>0) {
+      pubs <- rbind(pubs,
+                    cbind(phenotype=ph, SNP=var, nearest_gene=fuma$nearestGene[fuma$rsID==var], 
+                          reported_trait=st@studies$reported_trait, st@publications))
+    }
+  }
+}
+write_csv(pubs, path=paste0("./output/3b_emmax_summary/emmax_gwascat.csv"), append = TRUE)
+
+```
+
+
+
+

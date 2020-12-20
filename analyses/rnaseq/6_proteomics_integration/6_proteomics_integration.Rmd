@@ -1,0 +1,885 @@
+---
+title: "6 Integrating proteomics"
+author: "Annat Haber"
+date: '`r Sys.Date()`'
+output:
+  html_document:
+    toc: true
+    code_folding: hide
+---
+
+This script integrates the proteomics (TMT) dataset with the transcriptomic (RNAseq) space in order to explore the proteomic signature of the archetypes and compare their proteomic and transcriptomic profiles.  
+The integration is carried out by aligning the proteomic and the transcriptomic spaces using Procrustes superimposition.  
+In order to end up with the proteomics profile of the archetypes it makes sense to define the proteomics as the target matrix (X) and then superimpose the GE matrix (Y) to match the proteomics space. The archetypes position can then be imputed in the proteomics space. Then the proteomic profile of the archetypes can be calculated similarly to the way the gene expression profiles were caculated in [1_fit_archetypes.Rmd](analyses/1_1_fit_archetypes/1_fit_archetypes.Rmd), by finding proteins whose abundance decreases significantly with distance from archetype position (or with limma).
+
+```{r setup, warning=FALSE, message=FALSE}
+knitr::opts_knit$set(root.dir = rprojroot::find_rstudio_root_file())
+knitr::opts_chunk$set(cache=TRUE, cache.extra = R.version)
+```
+
+```{r libaries, warning=FALSE, message=FALSE}
+suppressPackageStartupMessages({
+  library(ggplot2)
+  library(ggfortify)
+  library(GGally)
+  library(cowplot)
+  library(Matrix)
+  library(tidyverse)
+  library(pins)
+  library(grid)
+  library(vegan)
+})
+
+```
+
+```{r predict_proc}
+# A function for predicting new data from procrustes fit object regardless of scaling
+# Modified from vegan::predict.procrustes
+# y.cs is centroid size of the original matrix (Y)
+# y.means is the centroid of the original matrix (Y)
+predict.proc <- function (object, newdata, y.cs=NULL, y.mean) {
+  Y <- as.matrix(newdata)
+  Y <- Y - matrix(y.mean, byrow=TRUE, nr=nrow(Y), nc=length(y.mean))
+  if (object$symmetric & !is.null(y.cs)) Y <- Y/y.cs
+  Y <- (object$scale * Y) %*% object$rotation
+  colnames(Y) <- colnames(newdata)
+  Y
+}
+
+```
+
+# Input
+Loading clean gene expression and archetyppe data from the first step (1_fit_archetypes).  
+Loading proteomics data from Emory (TMT-labeled MS/MS-based; A & T Wingo).  
+```{r load_data, warning=FALSE, message=FALSE}
+# key between proteomics ID and project ID (from T&A Wingo)
+protkey <- read_csv("data/metadata/proteomics_ROS_MAP_TRAITS_clean.csv",
+                    col_types=cols(.default = "c")) %>% 
+  dplyr::select(-Batch) 
+
+# Load metadata with archetype classification and distances
+arch.meta <- readRDS("analyses/rnaseq/1_fit_archetypes/archetypes_meta_k3p20_AD.RDS") %>%
+  merge(protkey, by="projid", all.x=TRUE, all.y=FALSE) %>%
+  arrange(rnaseq_id)
+
+# Load Emory's proteomics data, transpose so that samples are rows, match with rnaseq_id and make it rownames
+data.pt <- read_csv("data/proteomics_n391_residual_log2_batchMSsexPMIageStudy.csv") %>%
+  column_to_rownames("X1") %>%
+  drop_na() %>% # remove proteins with any na values
+  t() %>% as.data.frame() %>% 
+  rownames_to_column(var="proteomicsid") %>%
+  merge(select(arch.meta, rnaseq_id, proteomicsid), by="proteomicsid", all=FALSE) %>%
+  arrange(rnaseq_id) %>%
+  select(-proteomicsid) %>%
+  column_to_rownames("rnaseq_id")
+  
+# Load gene expression data for all samples and the three archetypes
+arch.ge <- readRDS("analyses/rnaseq/1_fit_archetypes/archetypes_ge_k3p20_AD.RDS")
+
+# Load gene expression PCA for all samples and the three archetypes
+arch.pca <- readRDS("analyses/rnaseq/1_fit_archetypes/archetypes_pca_k3p20_AD.RDS")
+varpc <- 100 * arch.pca[["all.pca"]]$sdev^2 / sum(arch.pca[["all.pca"]]$sdev^2) %>%
+  round(2)
+arch.pca <- arch.pca$arch.pca %>%
+  as.data.frame() %>%
+  rownames_to_column(var="rnaseq_id")
+
+# Load top genes associated with each archetype
+topgenes <- readRDS("analyses/rnaseq/2b_topgenes_annotations/topgenes.anno.RDS")
+
+# Filter arch.meta to include only the intersection between ge and pt
+meta.pt <- arch.meta %>%
+    filter(rnaseq_id %in% rownames(data.pt))
+
+# Load arcfit object
+arcfit <- readRDS("analyses/rnaseq/1_fit_archetypes/arcfit_k3.RDS")[["AD"]][["p20"]]
+
+# Load logFC for all genes
+LogFC.ge <- readRDS("analyses/rnaseq/1_fit_archetypes/logFC_allres_k3p20_AD.RDS")
+  
+archnames <- c("Archetype_1", "Archetype_2", "Archetype_3")
+```
+  
+# Archetype classfication and position; k=3 p=20 AD only
+
+```{r pca.ge}
+Cge.arch <- arch.pca%>%
+  filter( rnaseq_id %in% archnames) %>%
+  column_to_rownames("rnaseq_id")
+
+Cge <- arch.pca %>%
+  filter(! rnaseq_id %in% archnames)
+
+Cge %>%
+  mutate(Archetype = arch.meta$Archetype, Diagnosis = arch.meta$Diagnosis) %>%
+  ggplot() + 
+      geom_point(aes(x=PC1, y=PC2, color=Archetype, shape=Diagnosis)) +
+      geom_point(data=Cge.arch, aes(x=PC1, y=PC2), color="black", size=10, shape="*") +
+      geom_label(data=Cge.arch, aes(x=PC1, y=PC2, label=c("1","2","3")), nudge_y = 3, size=3) +
+      xlab(paste0("PC1 (", varpc[1], "%)")) +
+      ylab(paste0("PC2 (", varpc[2], "%)")) +
+      ggtitle("Transcriptomics PCA")
+
+# extract samples and archetypes that are not in the proteomic data ("new data" for the predict function)
+Cge.nd <- Cge %>%
+  filter(! rnaseq_id %in% rownames(data.pt)) %>%
+  column_to_rownames("rnaseq_id")
+
+# extract samples and archetypes that occur in the proteomic data
+Cge <- Cge %>%
+  filter(rnaseq_id %in% rownames(data.pt)) %>%
+  column_to_rownames("rnaseq_id")
+```
+  
+
+```{r pca.prot}
+PCpt <- prcomp(data.pt)
+
+autoplot(PCpt, 
+         data = meta.pt, 
+         colour = 'Archetype',
+         main="Proteomics PCA")
+
+Cpt <- PCpt$x[,1:20]
+```
+
+**Making sure samples are in the same order in both spaces**
+```{r}
+order(match(rownames(Cpt), rownames(Cge)))
+```
+
+    
+# Comparing ordinations {.tabset .tabset-fade .tabset-pills}
+
+Superimposing two configurations (ordinations in this case) with Procrustes superimposition involves translating them to the origin, scaling them to a common scale, and rotating one matrix (Y) onto the other (X, the target matrix). The roration matrix is found by decomposing the crossproduct of X and Y. The scaling is controlled by two parameters in the vegan::procrustes() function: scale and symmetric.  
+The code for vegan::procrustes() indicates the following:
+
+symmetric==TRUE: both matrices are scaled by their centroid size (variance*(n-1)); otherwise the two matrices are translated and Y is rotated without any scaling.  
+
+scale==TRUE: the rotated Y matrix is scaled by the centroid size of the crossproduct, while X isn't scaled at all; otherwise, if symmetric==TRUE both matrices end up with centroid size 1, if symmetric==FALSE both retain their original scale.  
+
+Using scale=FALSE and symmetric==FALSE (partial PS) is not sensible here because it does not put the spaces in a comparable scale, and the original scale isn't meaningful here in itself (unlike size when objects like skulls are compared). We want the archetypes proteomic imputations to be comparable to the protemic profiles of the real patients.
+
+Using scale=FALSE and symmetric==TRUE (full PS) is the usual practice in geometric morphometrics and preserve the procrustes distance between the two configurations as both matrices end up scaled to centroid size 1. However, predictions will not be in the original proteomics scale, which is what we want here eventually.
+
+Using scale=TRUE and symmetric==FALSE is the only option for predict.procrustes(). X is in its original scale, Y is scaled by the crossproduct. It should be possible in principle to do it with symmetric PS (as often done in GM), but then it would require another step to translate the archetype imputations to the original proteomics space to get their proteomic profiles. 
+
+Using scale=TRUE and symmetric==TRUE is the only option for protest. It is said in the manual that it minimizes residuals compared to scale==FALSE and symmetric==TRUE, but it is probably more sensitive to samples that are outliers in one space but not in the other (dispersing the differences more "equaly" among the non-outliers, dragging everything else towards the outliers).
+  
+Eventually, the results are always presented in the coordinate basis of the target, with both matrices translated to the origin. The target matrix may be scaled depending on the above parameters but not rotated.
+
+The plots below show the superimposed ordinations, once when the target matrix is the transcriptomics and once when it's the proteomics. The arrows point to the target, black circles are the rotated matrix. The violin plots show the distribution of residuals ( sum of squared deviations between the two ordinations) broken down by archetype classes.
+
+There is not much difference between the archetypes in how well their gene expression aligns with their protemics, regardless of which matrix is the target. Most of the times, archetype 1 is slightly less well aligned than the other two, when the target is transcriptomics.
+
+```{r procrustes}
+
+cs.ge <- sqrt(sum(Cge^2)) # centroid size of ge ordination
+mean.ge <- colMeans(Cge) # mean of ge ordination
+Cge.arch <- as.matrix(Cge.arch)
+
+pars <- expand.grid(c(TRUE,FALSE), c(TRUE,FALSE))[,2:1]
+rownames(pars) <- c("TT", "TF", "FT", "FF")
+res.ptL <- res.geL <- Carch.ptL <- Carch.geL <- distCl.ptL <- distCl.geL <- list()
+
+# target is protemoics
+for (p in rownames(pars)) {
+  scale=pars[p,1]
+  symmetric=pars[p,2]
+  
+  res <- vegan::procrustes(Cpt, Cge, scale=scale, symmetric=symmetric)
+  # imputed position of archetypes (translated, scaled, and rotated)
+  ap <- predict.proc(res, Cge.arch, y.cs=cs.ge, y.mean=mean.ge) 
+  # distances between proteomics samples and imputed archetypes
+  dist <- as.matrix(dist(rbind(ap, res$X), method="euclidean"))[-c(1:3),1:3] %>%
+      as.data.frame()
+  
+  # classification of proteomic samples to imputed archetypes
+  dist$Archetype <- apply(dist, 1, function(x){names(x)[x==min(x)]})
+  
+  Carch.ptL[[p]] <- ap 
+  res.ptL[[p]] <- res
+  distCl.ptL[[p]] <- dist
+
+  rm(dist, res, ap)
+}
+
+# target is transcriptomics
+for (p in rownames(pars)) {
+  scale=pars[p,1]
+  symmetric=pars[p,2]
+  
+  res <- vegan::procrustes(Cge, Cpt, scale=scale, symmetric=symmetric)
+  # aligned position of archetypes (translated, and scaled if symmetric==TRUE)
+  if(symmetric) {ap <- (Cge.arch-mean.ge)/cs.ge} else {ap <- Cge.arch-mean.ge}
+  # distances between proteomics samples and aligned archetypes
+  dist <- as.matrix(dist(rbind(ap, res$X), method="euclidean"))[-c(1:3),1:3] %>% 
+      as.data.frame()
+  # classification of proteomic samples to aligned archetypes
+  dist$Archetype <- apply(dist, 1, function(x){names(x)[x==min(x)]}) 
+  
+  Carch.geL[[p]] <- ap 
+  res.geL[[p]] <- res
+  distCl.geL[[p]] <- dist
+
+  rm(dist, res, ap)
+  }
+
+```
+
+## Ordinations {.tabset .tabset-fade .tabset-pills}
+
+### scale=TRUE symmetric=TRUE
+```{r ordinations_TT}
+res.pt <- res.ptL[["TT"]]
+res.ge <- res.geL[["TT"]]
+
+data.frame(dim1y=res.pt$Yrot[,1],
+dim2y=res.pt$Yrot[,2],dim1x=res.pt$X[,1],
+dim2x=res.pt$X[,2], arch=meta.pt$Archetype) %>%
+  ggplot() +
+  geom_segment(aes(x=dim1y,y=dim2y,xend=dim1x,yend=dim2x,colour=arch),arrow=arrow(length=unit(0.2,"cm"))) +
+  geom_point(aes(x=dim1y, y=dim2y, colour=arch)) +
+  geom_point(aes(x=dim1y, y=dim2y), shape=21, colour="black") +
+  geom_label(data=Carch.ptL[["TT"]], aes(x=PC1, y=PC2, label=c("1","2","3")), size=3) +
+ ggtitle("Target is proteomics")
+
+data.frame(dim1y=res.ge$Yrot[,1],
+dim2y=res.ge$Yrot[,2],dim1x=res.ge$X[,1],
+dim2x=res.ge$X[,2], arch=meta.pt$Archetype) %>%
+  ggplot() +
+  geom_segment(aes(x=dim1y,y=dim2y,xend=dim1x,yend=dim2x,colour=arch),arrow=arrow(length=unit(0.2,"cm"))) +
+  geom_point(aes(x=dim1y, y=dim2y, colour=arch)) +
+  geom_point(aes(x=dim1y, y=dim2y), shape=21, colour="black") +
+  geom_label(data=Carch.geL[["TT"]], aes(x=PC1, y=PC2, label=c("1","2","3")), size=3) +
+  ggtitle("Target is transcriptomics")
+
+```
+
+
+### scale=TRUE symmetric=FALSE
+```{r ordinations_TF}
+res.pt <- res.ptL[["TF"]]
+res.ge <- res.geL[["TF"]]
+
+data.frame(dim1y=res.pt$Yrot[,1],
+dim2y=res.pt$Yrot[,2],dim1x=res.pt$X[,1],
+dim2x=res.pt$X[,2], arch=meta.pt$Archetype) %>%
+  ggplot() +
+  geom_segment(aes(x=dim1y,y=dim2y,xend=dim1x,yend=dim2x,colour=arch),arrow=arrow(length=unit(0.2,"cm"))) +
+  geom_point(aes(x=dim1y, y=dim2y, colour=arch)) +
+  geom_point(aes(x=dim1y, y=dim2y), shape=21, colour="black") +
+  geom_label(data=Carch.ptL[["TF"]], aes(x=PC1, y=PC2, label=c("1","2","3")), size=3) +
+  ggtitle("Target is proteomics")
+
+data.frame(dim1y=res.ge$Yrot[,1],
+dim2y=res.ge$Yrot[,2],dim1x=res.ge$X[,1],
+dim2x=res.ge$X[,2], arch=meta.pt$Archetype) %>%
+  ggplot() +
+  geom_segment(aes(x=dim1y,y=dim2y,xend=dim1x,yend=dim2x,colour=arch),arrow=arrow(length=unit(0.2,"cm"))) +
+  geom_point(aes(x=dim1y, y=dim2y, colour=arch)) +
+  geom_point(aes(x=dim1y, y=dim2y), shape=21, colour="black") +
+  geom_label(data=Carch.geL[["TF"]], aes(x=PC1, y=PC2, label=c("1","2","3")), size=3) +
+  ggtitle("Target is transcriptomics")
+
+
+```  
+
+
+### scale=FALSE symmetric=TRUE
+```{r ordinations_FT}
+res.pt <- res.ptL[["FT"]]
+res.ge <- res.geL[["FT"]]
+
+data.frame(dim1y=res.pt$Yrot[,1],
+dim2y=res.pt$Yrot[,2],dim1x=res.pt$X[,1],
+dim2x=res.pt$X[,2], arch=meta.pt$Archetype) %>%
+  ggplot() +
+  geom_segment(aes(x=dim1y,y=dim2y,xend=dim1x,yend=dim2x,colour=arch),arrow=arrow(length=unit(0.2,"cm"))) +
+  geom_point(aes(x=dim1y, y=dim2y, colour=arch)) +
+  geom_point(aes(x=dim1y, y=dim2y), shape=21, colour="black") +
+  geom_label(data=Carch.ptL[["FT"]], aes(x=PC1, y=PC2, label=c("1","2","3")), size=3) +
+  ggtitle("Target is proteomics")
+
+data.frame(dim1y=res.ge$Yrot[,1],
+dim2y=res.ge$Yrot[,2],dim1x=res.ge$X[,1],
+dim2x=res.ge$X[,2], arch=meta.pt$Archetype) %>%
+  ggplot() +
+  geom_segment(aes(x=dim1y,y=dim2y,xend=dim1x,yend=dim2x,colour=arch),arrow=arrow(length=unit(0.2,"cm"))) +
+  geom_point(aes(x=dim1y, y=dim2y, colour=arch)) +
+  geom_point(aes(x=dim1y, y=dim2y), shape=21, colour="black") +
+  geom_label(data=Carch.geL[["FT"]], aes(x=PC1, y=PC2, label=c("1","2","3")), size=3) +
+  ggtitle("Target is transcriptomics")
+
+
+```    
+
+### scale=FALSE symmetric=FALSE
+```{r ordinations_FF}
+res.pt <- res.ptL[["FF"]]
+res.ge <- res.geL[["FF"]]
+
+data.frame(dim1y=res.pt$Yrot[,1],
+dim2y=res.pt$Yrot[,2],dim1x=res.pt$X[,1],
+dim2x=res.pt$X[,2], arch=meta.pt$Archetype) %>%
+  ggplot() +
+  geom_segment(aes(x=dim1y,y=dim2y,xend=dim1x,yend=dim2x,colour=arch),arrow=arrow(length=unit(0.2,"cm"))) +
+  geom_point(aes(x=dim1y, y=dim2y, colour=arch)) +
+  geom_point(aes(x=dim1y, y=dim2y), shape=21, colour="black") +
+  geom_label(data=Carch.ptL[["FF"]], aes(x=PC1, y=PC2, label=c("1","2","3")), size=3) +
+  ggtitle("Target is proteomics")
+
+data.frame(dim1y=res.ge$Yrot[,1],
+dim2y=res.ge$Yrot[,2],dim1x=res.ge$X[,1],
+dim2x=res.ge$X[,2], arch=meta.pt$Archetype) %>%
+  ggplot() +
+  geom_segment(aes(x=dim1y,y=dim2y,xend=dim1x,yend=dim2x,colour=arch),arrow=arrow(length=unit(0.2,"cm"))) +
+  geom_point(aes(x=dim1y, y=dim2y, colour=arch)) +
+  geom_point(aes(x=dim1y, y=dim2y), shape=21, colour="black") +
+  geom_label(data=Carch.geL[["FF"]], aes(x=PC1, y=PC2, label=c("1","2","3")), size=3) +
+  ggtitle("Target is transcriptomics")
+
+
+```    
+
+## Residuals {.tabset .tabset-fade .tabset-pills}
+
+Sum of squared deviations between patients position in proteomics and transcriptomics after superimposition.
+
+### scale=TRUE symmetric=TRUE
+```{r residuals_TT}
+res.pt <- res.ptL[["TT"]]
+res.ge <- res.geL[["TT"]]
+
+# residuals between sample's position in proteomics and transcriptomics ordinations
+PTdist <- rbind(
+  meta.pt %>%
+    select(Archetype, rnaseq_id) %>%
+    mutate(PTdist=residuals(res.ge)) %>%
+    mutate(Target="Transcriptomics"),
+  meta.pt %>%
+    select(Archetype, rnaseq_id) %>%
+    mutate(PTdist=residuals(res.pt)) %>%
+    mutate(Target="Proteomics")
+)
+
+# plot residuals by archetype
+ggplot(PTdist, aes(x=Archetype, y=PTdist, fill=Target)) +
+  geom_violin(trim=FALSE) +
+  geom_boxplot(width=0.3, position=position_dodge(0.9)) + theme_minimal() +
+  xlab(NULL)
+
+```
+
+
+### scale=TRUE symmetric=FALSE
+```{r residuals_TF}
+res.pt <- res.ptL[["TF"]]
+res.ge <- res.geL[["TF"]]
+
+# residuals between sample's position in proteomics and transcriptomics ordinations
+PTdist <- rbind(
+  meta.pt %>%
+    select(Archetype, rnaseq_id) %>%
+    mutate(PTdist=residuals(res.ge)) %>%
+    mutate(Target="Transcriptomics"),
+  meta.pt %>%
+    select(Archetype, rnaseq_id) %>%
+    mutate(PTdist=residuals(res.pt)) %>%
+    mutate(Target="Proteomics")
+)
+
+# plot residuals by archetype
+ggplot(PTdist, aes(x=Archetype, y=PTdist, fill=Target)) +
+  geom_violin(trim=FALSE) +
+  geom_boxplot(width=0.3, position=position_dodge(0.9)) + theme_minimal() +
+  xlab(NULL)
+
+# plot residuals by archetype
+ggplot(filter(PTdist, Target=="Proteomics"), aes(x=Archetype, y=PTdist, fill=Target)) +
+  geom_violin(trim=FALSE) +
+  geom_boxplot(width=0.3, position=position_dodge(0.9)) + theme_minimal() +
+  xlab(NULL)
+
+
+```  
+
+### scale=FALSE symmetric=TRUE
+```{r residuals_FT}
+res.pt <- res.ptL[["FT"]]
+res.ge <- res.geL[["FT"]]
+
+# residuals between sample's position in proteomics and transcriptomics ordinations
+PTdist <- rbind(
+  meta.pt %>%
+    select(Archetype, rnaseq_id) %>%
+    mutate(PTdist=residuals(res.ge)) %>%
+    mutate(Target="Transcriptomics"),
+  meta.pt %>%
+    select(Archetype, rnaseq_id) %>%
+    mutate(PTdist=residuals(res.pt)) %>%
+    mutate(Target="Proteomics")
+)
+
+# plot residuals by archetype
+ggplot(PTdist, aes(x=Archetype, y=PTdist, fill=Target)) +
+  geom_violin(trim=FALSE) +
+  geom_boxplot(width=0.3, position=position_dodge(0.9)) + theme_minimal() +
+  xlab(NULL)
+
+```
+
+### scale=FALSE symmetric=FALSE
+```{r residuals_FF}
+res.pt <- res.ptL[["FF"]]
+res.ge <- res.geL[["FF"]]
+
+# residuals between sample's position in proteomics and transcriptomics ordinations
+PTdist <- rbind(
+  meta.pt %>%
+    select(Archetype, rnaseq_id) %>%
+    mutate(PTdist=residuals(res.ge)) %>%
+    mutate(Target="Transcriptomics"),
+  meta.pt %>%
+    select(Archetype, rnaseq_id) %>%
+    mutate(PTdist=residuals(res.pt)) %>%
+    mutate(Target="Proteomics")
+)
+
+# plot residuals by archetype
+ggplot(PTdist, aes(x=Archetype, y=PTdist, fill=Target)) +
+  geom_violin(trim=FALSE) +
+  geom_boxplot(width=0.3, position=position_dodge(0.9)) + theme_minimal() +
+  xlab(NULL)
+
+```
+
+## Distances {.tabset .tabset-fade .tabset-pills}
+
+Distance between each patient from each archetypes in the transcriptomic space compared to their distances in the proteomic space after superimposition, shown below when the target is proteomics and when the target is transcriptomics.
+  
+### scale=TRUE symmetric=TRUE
+```{r, distances_TT, fig.width=10, fig.height=4}
+# distance of proteomics samples from archetypes when proteomics is the target matrix
+dist_pp <- distCl.ptL[["TT"]]  %>%
+  select(-Archetype) %>%
+  rownames_to_column("rnaseq_id") %>%
+  pivot_longer(cols=-rnaseq_id, names_to = "dist_from", values_to = "Proteomics")
+
+# distance of proteomics samples from archetypes when transcriptomics is the target matrix
+dist_pg <- distCl.geL[["TT"]]  %>%
+  select(-Archetype) %>%
+  rownames_to_column("rnaseq_id") %>%
+  pivot_longer(cols=-rnaseq_id, names_to = "dist_from", values_to = "Proteomics")
+
+# distance of ge samples from archetypes in the transcriptomic space
+dist_g <- meta.pt %>%
+  select(rnaseq_id, Archetype_1:Archetype_3) %>%
+  pivot_longer(cols=-rnaseq_id, names_to = "dist_from", values_to = "Transcriptomics")
+  
+merge(dist_g, dist_pp, all=TRUE, by=c("rnaseq_id", "dist_from")) %>%
+  ggplot() +
+  geom_point(aes(x=Transcriptomics, y=Proteomics, color=dist_from)) +
+  ggtitle("Distances from archetypes when target is proteomics") +
+  facet_wrap("dist_from", scale="free_y")
+
+merge(dist_g, dist_pg, all=TRUE, by=c("rnaseq_id", "dist_from")) %>%
+  ggplot() +
+  geom_point(aes(x=Transcriptomics, y=Proteomics, color=dist_from)) +
+  ggtitle("Distances from archetypes when target is transcriptomics") +
+  facet_wrap("dist_from", scale="free_y")
+
+```
+
+### scale=TRUE symmetric=FALSE
+```{r, distances_TF, fig.width=10, fig.height=4}
+# distance of proteomics samples from archetypes when proteomics is the target matrix
+dist_pp <- distCl.ptL[["TF"]]  %>%
+  select(-Archetype) %>%
+  rownames_to_column("rnaseq_id") %>%
+  pivot_longer(cols=-rnaseq_id, names_to = "dist_from", values_to = "Proteomics")
+
+# distance of proteomics samples from archetypes when transcriptomics is the target matrix
+dist_pg <- distCl.geL[["TF"]]  %>%
+  select(-Archetype) %>%
+  rownames_to_column("rnaseq_id") %>%
+  pivot_longer(cols=-rnaseq_id, names_to = "dist_from", values_to = "Proteomics")
+
+# distance of rnaseq samples from archetypes in the transcriptomic space
+dist_g <- meta.pt %>%
+  select(rnaseq_id, Archetype_1:Archetype_3) %>%
+  pivot_longer(cols=-rnaseq_id, names_to = "dist_from", values_to = "Transcriptomics")
+  
+merge(dist_g, dist_pp, all=TRUE, by=c("rnaseq_id", "dist_from")) %>%
+  ggplot() +
+  geom_point(aes(x=Transcriptomics, y=Proteomics, color=dist_from)) +
+  ggtitle("Distances from archetypes when target is proteomics") +
+  facet_wrap("dist_from", scale="free_y")
+
+merge(dist_g, dist_pg, all=TRUE, by=c("rnaseq_id", "dist_from")) %>%
+  ggplot() +
+  geom_point(aes(x=Transcriptomics, y=Proteomics, color=dist_from)) +
+  ggtitle("Distances from archetypes when target is transcriptomics") +
+  facet_wrap("dist_from", scale="free_y")
+
+```
+
+### scale=FALSE symmetric=TRUE
+```{r, distances_FT, fig.width=10, fig.height=4}
+# distance of proteomics samples from archetypes when proteomics is the target matrix
+dist_pp <- distCl.ptL[["FT"]]  %>%
+  select(-Archetype) %>%
+  rownames_to_column("rnaseq_id") %>%
+  pivot_longer(cols=-rnaseq_id, names_to = "dist_from", values_to = "Proteomics")
+
+# distance of proteomics samples from archetypes when transcriptomics is the target matrix
+dist_pg <- distCl.geL[["FT"]]  %>%
+  select(-Archetype) %>%
+  rownames_to_column("rnaseq_id") %>%
+  pivot_longer(cols=-rnaseq_id, names_to = "dist_from", values_to = "Proteomics")
+
+# distance of rnaseq samples from archetypes in the transcriptomic space
+dist_g <- meta.pt %>%
+  select(rnaseq_id, Archetype_1:Archetype_3) %>%
+  pivot_longer(cols=-rnaseq_id, names_to = "dist_from", values_to = "Transcriptomics")
+  
+merge(dist_g, dist_pp, all=TRUE, by=c("rnaseq_id", "dist_from")) %>%
+  ggplot() +
+  geom_point(aes(x=Transcriptomics, y=Proteomics, color=dist_from)) +
+  ggtitle("Distances from archetypes when target is proteomics") +
+  facet_wrap("dist_from", scale="free_y")
+
+merge(dist_g, dist_pg, all=TRUE, by=c("rnaseq_id", "dist_from")) %>%
+  ggplot() +
+  geom_point(aes(x=Transcriptomics, y=Proteomics, color=dist_from)) +
+  ggtitle("Distances from archetypes when target is transcriptomics") +
+  facet_wrap("dist_from", scale="free_y")
+
+```
+
+### scale=FALSE symmetric=FALSE
+```{r, distances_FF, fig.width=10, fig.height=4}
+# distance of proteomics samples from archetypes when proteomics is the target matrix
+dist_pp <- distCl.ptL[["FF"]]  %>%
+  select(-Archetype) %>%
+  rownames_to_column("rnaseq_id") %>%
+  pivot_longer(cols=-rnaseq_id, names_to = "dist_from", values_to = "Proteomics")
+
+# distance of proteomics samples from archetypes when transcriptomics is the target matrix
+dist_pg <- distCl.geL[["FF"]]  %>%
+  select(-Archetype) %>%
+  rownames_to_column("rnaseq_id") %>%
+  pivot_longer(cols=-rnaseq_id, names_to = "dist_from", values_to = "Proteomics")
+
+# distance of rnaseq samples from archetypes in the transcriptomic space
+dist_g <- meta.pt %>%
+  select(rnaseq_id, Archetype_1:Archetype_3) %>%
+  pivot_longer(cols=-rnaseq_id, names_to = "dist_from", values_to = "Transcriptomics")
+  
+merge(dist_g, dist_pp, all=TRUE, by=c("rnaseq_id", "dist_from")) %>%
+  ggplot() +
+  geom_point(aes(x=Transcriptomics, y=Proteomics, color=dist_from)) +
+  ggtitle("Distances from archetypes when target is proteomics") +
+  facet_wrap("dist_from", scale="free_y")
+
+merge(dist_g, dist_pg, all=TRUE, by=c("rnaseq_id", "dist_from")) %>%
+  ggplot() +
+  geom_point(aes(x=Transcriptomics, y=Proteomics, color=dist_from)) +
+  ggtitle("Distances from archetypes when target is transcriptomics") +
+  facet_wrap("dist_from", scale="free_y")
+
+```
+
+## Classification {.tabset .tabset-fade .tabset-pills}
+### scale=TRUE symmetric=TRUE
+```{r classes_TT, out.width=c('50%', '50%'), fig.show='hold', out.extra='style="background-color: #9ecff7; padding:1px; display: inline-block;"'}
+table("Proteomics"=distCl.ptL[["TT"]]$Archetype, "Transcriptomics"=meta.pt$Archetype) %>% 
+   vcd::mosaic(split_vertical=TRUE, shade=TRUE, 
+              labeling_args = list(abbreviate_labs = c(Proteomics = TRUE, Transcriptomics = TRUE), rot_labels=c(0,0), tl_labels = FALSE, tl_varnames = TRUE), 
+              main="Target is Proteomics")
+  
+ table("Proteomics"=distCl.geL[["TT"]]$Archetype, "Transcriptomics"=meta.pt$Archetype) %>% 
+  vcd::mosaic(split_vertical=TRUE, shade=TRUE, 
+              labeling_args = list(abbreviate_labs = c(Proteomics = TRUE, Transcriptomics = TRUE), rot_labels=c(0,0), tl_labels = FALSE, tl_varnames = TRUE), 
+              main="Target is Transcriptomics")
+ 
+```
+
+### scale=TRUE symmetric=FALSE
+```{r classes_TF, out.width=c('50%', '50%'), fig.show='hold', out.extra='style="background-color: #9ecff7; padding:1px; display: inline-block;"'}
+table("Proteomics"=distCl.ptL[["TF"]]$Archetype, "Transcriptomics"=meta.pt$Archetype) %>% 
+   vcd::mosaic(split_vertical=TRUE, shade=TRUE, 
+              labeling_args = list(abbreviate_labs = c(Proteomics = TRUE, Transcriptomics = TRUE), rot_labels=c(0,0), tl_labels = FALSE, tl_varnames = TRUE), 
+              main="Target is Proteomics")
+  
+ table("Proteomics"=distCl.geL[["TF"]]$Archetype, "Transcriptomics"=meta.pt$Archetype) %>% 
+   vcd::mosaic(split_vertical=TRUE, shade=TRUE, 
+              labeling_args = list(abbreviate_labs = c(Proteomics = TRUE, Transcriptomics = TRUE), rot_labels=c(0,0), tl_labels = FALSE, tl_varnames = TRUE), 
+              main="Target is Transcriptomics")
+ 
+```
+
+
+### scale=FALSE symmetric=TRUE
+```{r classes_FT, out.width=c('50%', '50%'), fig.show='hold', out.extra='style="background-color: #9ecff7; padding:1px; display: inline-block;"'}
+table("Proteomics"=distCl.ptL[["FT"]]$Archetype, "Transcriptomics"=meta.pt$Archetype) %>% 
+  vcd::mosaic(split_vertical=TRUE, shade=TRUE, 
+              labeling_args = list(abbreviate_labs = c(Proteomics = TRUE, Transcriptomics = TRUE), rot_labels=c(0,0), tl_labels = FALSE, tl_varnames = TRUE), 
+              main="Target is Proteomics")
+  
+ table("Proteomics"=distCl.geL[["FT"]]$Archetype, "Transcriptomics"=meta.pt$Archetype) %>% 
+  vcd::mosaic(split_vertical=TRUE, shade=TRUE, 
+              labeling_args = list(abbreviate_labs = c(Proteomics = TRUE, Transcriptomics = TRUE), rot_labels=c(0,0), tl_labels = FALSE, tl_varnames = TRUE), 
+              main="Target is Transcriptomics")
+ 
+```
+
+### scale=FALSE symmetric=FALSE
+```{r classes_FF, out.width=c('50%', '50%'), fig.show='hold', out.extra='style="background-color: #9ecff7; padding:1px; display: inline-block;"'}
+table("Proteomics"=distCl.ptL[["FF"]]$Archetype, "Transcriptomics"=meta.pt$Archetype) %>% 
+  vcd::mosaic(split_vertical=TRUE, shade=TRUE, 
+              labeling_args = list(abbreviate_labs = c(Proteomics = TRUE, Transcriptomics = TRUE), rot_labels=c(0,0), tl_labels = FALSE, tl_varnames = TRUE), 
+              main="Target is Proteomics")
+  
+ table("Proteomics"=distCl.geL[["FF"]]$Archetype, "Transcriptomics"=meta.pt$Archetype) %>% 
+   vcd::mosaic(split_vertical=TRUE, shade=TRUE, 
+              labeling_args = list(abbreviate_labs = c(Proteomics = TRUE, Transcriptomics = TRUE), rot_labels=c(0,0), tl_labels = FALSE, tl_varnames = TRUE), 
+              main="Target is Transcriptomics")
+ 
+```
+
+# Proteomics differential expression
+For each bootstrapped space, reversing the proteomics PCA for the imputed archetypes and finding their centroid. This creates a "population" of 200 samples for each archetype and 200 samples of "control" (the centroid). This then goes into limma to find logFC for each protein and each archetype relative to control, similar to the way logFC was calculated for gene expression data.
+## Reconstructing archetype samples
+```{r}
+res <- res.ptL[["FT"]] # procrustes results with proteomics as target
+BCL <- arcfit$pch_fits$XC # bootstrapped spaces
+
+k = ncol(BCL[[1]]) # number of archetypes
+p = nrow(BCL[[1]]) # number of PC's
+nb = length(BCL) # number of bootstrapped replicates
+
+# calculate PC scores for the centroid ("control" samples) in each bootstrapped space
+Bcontrol <- sapply(BCL, rowMeans)
+
+# Reorganize bootstrapped scores into one matrix including "control" samples (4*nb x p)
+BC <-  BCL %>%
+  unlist() %>% 
+  matrix(nr=p, nc=k*nb) %>% 
+  cbind(Bcontrol) %>%
+  t()
+
+# impute position of boostrapped archetypes in the proteomics space
+BCrot <- predict.proc(res, BC, y.cs=NULL, y.mean=mean.ge) 
+
+# project everything back to original proteomics space and translate to original center
+# (reversing the pca procedure)
+rotM <- PCpt$rotation # rotation matrix (eigenvectors)
+mu <- PCpt$center # means of proteomics data by which pc's were centered
+BCpt <- BCrot %*% t(rotM[,1:p]) %>% # rotating
+    scale(center = -mu, scale = FALSE) # translating
+ 
+rm(res, BCL, BC, Bcontrol)
+
+```
+
+## Calculating LogFC
+```{r}
+types.b <- rep(c(archnames, "Control"), each=nb)
+# calculate LogFC using limma
+lm.res.pt <- logFC.pt <-list()
+for (a in archnames) {
+  type <- types.b[types.b %in% c(a, "Control")]
+  de.df <-  as.data.frame(t( BCpt[types.b %in% c(a, "Control"),] ))
+  fit <- limma::lmFit(de.df, design=model.matrix(~type))
+  fit <- limma::eBayes(fit)
+  tt <- limma::topTable(fit, number=Inf, coef=2)
+  lm.res.pt[[a]] <- tt
+  logFC.pt[[a]] <- tt$logFC
+  rm(tt,fit, de.df, type)
+}
+
+logFC.pt$protein <- colnames(BCpt)
+logFC.pt <- as.data.frame(logFC.pt)
+
+# visualize with heatmap
+ComplexHeatmap::Heatmap(as.matrix(logFC.pt[,-4]),
+                        name="LogFC",
+                        show_row_dend = FALSE,
+                        show_row_names = FALSE,
+                        #row_order = order(logFC.pt[,3])
+                        )
+```
+
+## Annotations of significant proteins
+```{r}
+
+```
+
+# Gene-Protein associations
+
+## Pairwise correlations between top genes and all proteins
+There is some aggregation of gene-protein pairwise correlations by archetype.  
+Archetype_1 = coral; Archetype_2 = green; Archetype_3 = blue
+```{r}
+# Correlations between all proteins and all genes, focusing on the top genes
+ge.top <- arch.ge[meta.pt$rnaseq_id,topgenes$Ensembl.ID] 
+R <- cor(ge.top, data.pt)
+rc <- character(nrow(topgenes))
+rc <- ifelse(topgenes$Archetype=="Archetype_1", "coral3", 
+             ifelse(topgenes$Archetype=="Archetype_2", "green", "blue"))
+heatmap(R, RowSideColors = rc)
+```
+
+## Overlap of all proteins and all genes
+Match gene names with protein names
+```{r}
+genes <- LogFC.ge[[1]] %>% select(HGNC.ID) %>% drop_na(HGNC.ID) %>% pull()
+
+gp <- c()
+for (gn in genes) {
+  gpv <- grep(paste0("^\\d*[;|\\|]*", gn, "[;|\\|]"), colnames(data.pt), value=TRUE)
+  if (length(gpv) > 0) {
+    gp <- rbind(gp,
+              cbind("gene"=gn, "protein"=gpv))
+  }  else {
+    gp <- rbind(gp,
+              cbind("gene"=gn, "protein"=NA_character_))
+
+    }
+}
+
+gp <- as.data.frame(gp)
+```
+6 of the genes match two proteins each (instead of one)
+```{r}
+cbind(gp[duplicated(gp[,"gene"], incomparables = NA_character_),], 
+      "protein2"=gp[duplicated(gp[,"gene"], incomparables = NA_character_, fromLast = TRUE),"protein"])
+```
+Merge protein names with archetypes topgenes
+```{r}
+gpp <-topgenes %>%
+  select(HGNC.ID, Archetype) %>%
+  filter(!is.na(HGNC.ID)) %>% 
+  rename(gene=HGNC.ID) %>%
+  merge(gp, by="gene", all=TRUE, incomparables=NA, sort=FALSE) %>%
+  merge(select(logFC.pt, protein), by="protein", all=TRUE, incomparables=NA, sort=FALSE) %>%
+  mutate(Archetype=replace_na(Archetype, "None"))
+#%>%
+ # mutate("InOut"=if_else(is.na(gene), "Excluded", "Included"))
+```
+  
+### Overlap between archetype gene sets and proteomic dataset
+Number of proteins that are (or are not) included in the gene sets, and number of genes in each set that are included in the proteomic dataset
+```{r}
+gpp %>%
+  mutate(protein=if_else(is.na(protein), "Out", "In"), 
+         gene=if_else(is.na(gene), "Out", "In")) %>% 
+ # table() %>% 
+  ggplot(mapping=aes(x=gene, fill=protein)) +
+    geom_bar(position = "fill") +
+    geom_text(aes(label = ..count..), stat = "count", position = "fill", vjust=1.5) +
+    facet_wrap(~Archetype)
+```
+
+### Correlation between gene expression and protein abundance
+```{r}
+gp <- gpp %>% 
+  filter(!is.na(protein) & !is.na(gene)) %>%
+  merge(select(LogFC.ge[[1]], HGNC.ID, Ensembl.ID), 
+        by.x="gene", by.y="HGNC.ID", all.x=TRUE, all.y=FALSE, sort=FALSE, incomparables = NA) %>%
+  mutate_all(as.character)
+
+R.gp <- cor(arch.ge[meta.pt$rnaseq_id, gp$Ensembl.ID], data.pt[meta.pt$rnaseq_id, gp$protein]) %>%
+  diag() %>%
+  as_tibble_col(column_name="ge.pt.cor") %>%
+  mutate(gene=gp$gene)
+
+gp <- merge(gp, R.gp, by="gene")
+
+ggplot(filter(gp, Archetype!="None"), aes(x=Archetype, y=ge.pt.cor)) +
+  geom_boxplot()
+```
+
+### Correlation between gene and protein logFC
+```{r}
+lfc.ge <- rbind(cbind(LogFC.ge[[1]], Archetype="Archetype_1"),
+                cbind(LogFC.ge[[2]], Archetype="Archetype_2"),
+                cbind(LogFC.ge[[3]], Archetype="Archetype_3")) %>%
+  filter(!is.na(HGNC.ID)) %>%
+  select(gene=HGNC.ID, Archetype, logFC.ge=logFC)
+  
+
+lfc.pt <- logFC.pt %>%
+    pivot_longer(-protein, names_to = "Archetype", values_to = "logFC.pt") 
+
+gp <- merge(gp, lfc.pt, by=c("protein", "Archetype"), all.x = TRUE, all.y=FALSE) %>%
+  merge(lfc.ge, by=c("gene", "Archetype"), all.x = TRUE, all.y=FALSE)
+
+filter(gp, Archetype != "None") %>%
+ggplot(aes(x=logFC.ge, y=logFC.pt, color=Archetype)) +
+  geom_point() +
+  geom_smooth(method="lm")
+```
+
+## Cannonical correlations
+Pairwise distances between samples are preserved in Procrustes superimposition but not in Canonical Correlations.
+```{r, message=FALSE}
+cca <- CCorA(Cge, Cpt)
+
+pwd.ge.cc <- as.matrix(dist(cca$Cy))
+pwd.pt.cc <- as.matrix(dist(cca$Cx))
+
+pwd.ge <- as.matrix(dist(Cge))
+pwd.pt <- as.matrix(dist(Cpt))
+
+pwd.ge.ps <- as.matrix(dist(res.ptL[["FT"]]$Yrot))
+pwd.pt.ps <- as.matrix(dist(res.geL[["FT"]]$Yrot))
+
+df <- data.frame(pwd.ge = pwd.ge[upper.tri(pwd.ge)],
+                 pwd.pt = pwd.pt[upper.tri(pwd.pt)],
+                 pwd.ge.cc = pwd.ge.cc[upper.tri(pwd.ge.cc)],
+                 pwd.pt.cc = pwd.pt.cc[upper.tri(pwd.pt.cc)],
+                 pwd.ge.ps = pwd.ge.ps[upper.tri(pwd.ge.ps)],
+                 pwd.pt.ps = pwd.pt.ps[upper.tri(pwd.pt.ps)])
+
+ggpairs(df)
+```
+
+```{r,  out.width=c('50%', '50%'), fig.show='hold', out.extra='style="background-color: #9ecff7; padding:1px; display: inline-block;"'}
+ggplot(df) +
+  geom_point(aes(x=pwd.ge, y=pwd.ge.ps)) +
+  ggtitle("Pairwise distances between transcriptomic samples \n before and after Procrustes superimposition") +
+  xlab("Original PCA distances") +
+  ylab("Superimposed distances")
+
+ggplot(df) +
+  geom_point(aes(x=pwd.pt, y=pwd.pt.ps)) +
+  ggtitle("Pairwise distances between proteomic samples \n before and after Procrustes superimposition") +
+  xlab("Original PCA distances") +
+  ylab("Superimposed distances")
+
+ggplot(df) +
+  geom_point(aes(x=pwd.ge, y=pwd.ge.cc)) +
+  ggtitle("Pairwise distances between transcriptomic samples in PCA vs CCA") +
+  xlab("Original PCA distances") +
+  ylab("CCA distances")
+
+ggplot(df) +
+  geom_point(aes(x=pwd.pt, y=pwd.pt.cc)) +
+  ggtitle("Pairwise distances between proteomic samples in PCA vs CCA") +
+  xlab("Original PCA distances") +
+  ylab("CCA distances")
+
+```
+
+
+# Output
+``` {r output}
+outpath <- "analyses/rnaseq/6_proteomics_integration/"
+```
+
+# Session info
+```{r session-info}
+devtools::session_info()
+```

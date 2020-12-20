@@ -1,0 +1,181 @@
+---
+title: "2b Top genes annotations"
+output:
+  html_document:
+    toc: true
+    code_folding: hide
+---
+This script annotates the top genes associated with each archetype in terms of (sub)modules and GO enrichment, and cell specifity
+```{r setup}
+knitr::opts_knit$set(root.dir = rprojroot::find_rstudio_root_file())
+knitr::opts_chunk$set(echo = TRUE, warning=FALSE, message=FALSE, cache=TRUE, cache.extra = R.version)
+```
+
+```{r libaries}
+suppressPackageStartupMessages({
+  library(clusterProfiler)
+  library(GOsummaries)
+  library(vcd)
+  library(tidyverse)
+  })
+```
+
+# Input
+```{r}
+topgenes <- readRDS("analyses/rnaseq/1_fit_archetypes/topgenes_logFC_k3p20_AD.RDS")
+
+submodules <- read.csv(file="data/milind2019/submodules.csv", na.strings = "") %>%
+  dplyr::filter(Cohort=="rosmap") %>%
+  droplevels()
+bigmodules <- read.csv(file="data/milind2019/bigmodules.csv", na.strings = "") %>%
+  dplyr::filter(Cohort=="rosmap") %>%
+  droplevels()
+
+# cell-specific markers from McKenzie et al. 2017
+hum.specific <- read.csv("data/McKenzie_2017_Brain_Cell_Specific_Markers_Human_Specificity.csv", header=T, stringsAsFactors=F)
+
+```
+
+# Modules and submodules enrichment
+Add information about modules and submodules to top genes  
+Add their HGNC.ID as well, consistent with those in NM's submodules
+```{r ModuleAnnotation, warnnig=FALSE, message=FALSE}
+topgenes <- topgenes %>%
+  left_join(select(bigmodules, Ensembl.ID, Module), by = "Ensembl.ID") %>%
+  left_join(select(submodules, Ensembl.ID, Module, Submodule), by =c("Ensembl.ID", "Module")) %>%
+  select(Ensembl.ID, HGNC.ID, Module, Submodule, everything())
+
+```
+
+How many of the top genes are in one of the modules/submodules?
+``` {r compare_modules}
+cat(round(100*length(which(!is.na(topgenes$Submodule)))/nrow(topgenes)), "% of topgenes are in one of the submodules", "\n") # 62% in the submodules
+cat(round(100*length(which(!is.na(topgenes$Module)))/nrow(topgenes)), "% of topgenes are in one of the modules", "\n") # 84% in the big modules
+
+data <- select(topgenes, Module, Archetype) %>%
+  mutate(Module=substring(Module, 6))
+mytable <- xtabs(~ Module + Archetype, data)
+ftable(mytable) # print table
+summary(mytable) # chi-square test of indepedence
+assoc(mytable, shade=TRUE, labeling_args = list(abbreviate_labs = c(Module=6), varnames=c(FALSE,FALSE), rot_labels=c(0,0)))
+pdf(file = "analyses/rnaseq/2b_topgenes_annotations/chi2_modules.pdf")
+assoc(mytable, shade=TRUE,labeling_args = list(abbreviate_labs = c(Module=6), varnames=c(FALSE,FALSE), rot_labels=c(0,0)))
+dev.off()
+
+data <- select(topgenes, Submodule, Archetype) %>%
+  mutate(Submodule=substring(Submodule, 6))
+mytable <- xtabs(~ Submodule + Archetype, data)
+ftable(mytable) # print table
+summary(mytable) # chi-square test of indepedence
+assoc(mytable, shade=TRUE, labeling_args = list(abbreviate_labs = c(Submodule=6), varnames=c(FALSE,FALSE), rot_labels=c(0,0)))
+pdf(file = "analyses/rnaseq/2b_topgenes_annotations/chi2_submodules.pdf")
+assoc(mytable, shade=TRUE, labeling_args = list(abbreviate_labs = c(Submodule=6), varnames=c(FALSE,FALSE), rot_labels=c(0,0)))
+dev.off()
+
+```
+arch3_B
+yellow_1: trans-synaptic signaling
+
+arch2, A+B
+blue_1: astrocyte metabolism; catabolic; oxydation-reduction
+blue_4: astrocyte and microglia activation; cellular motility & regeneration
+brown_1: gliogenesis; oligodendrocytic myelination and lysosomal activity
+
+arch1, A
+blue_2: cytokine (immune) signaling; inflamatory
+blue_3: microglial activation; immune response regulation
+turquoise_2: protein folding; cellular response to stress
+
+# GO annotations for topgenes
+
+```{r GOannotations}
+archetypes <- unique(topgenes$Archetype)
+
+all.go <- c()
+for (arch in archetypes) {
+    cat("Annotating: ", arch, "\n")
+# translate ensembl ID to entrez ID
+ eg <- bitr(topgenes[topgenes$Archetype == arch, "Ensembl.ID"], fromType="ENSEMBL", toType="ENTREZID", OrgDb="org.Hs.eg.db")
+  
+  # Annotate module
+  goBP.anno <- enrichGO(gene=eg[,2], ont = "BP", pAdjustMethod = "BH", pvalueCutoff = 0.01, qvalueCutoff=0.05, OrgDb="org.Hs.eg.db", readable=TRUE)
+  goBP.anno <- as.data.frame(goBP.anno@result)
+  
+  # Add to data frame
+  if (nrow(goBP.anno) > 0) {
+    all.go <- rbind(all.go, cbind("Archetype"=arch, goBP.anno))
+  }
+}
+colnames(all.go)[2] <- "GO.ID"
+colnames(all.go)[9] <- "HGNC.ID"
+
+# write out lists to generate tag clouds with REVIGO
+for (arch in archetypes) {
+  all.go %>%
+    dplyr::filter(Archetype==arch) %>%
+    dplyr::select(GO.ID, p.adjust) %>%
+    write_tsv(paste0("analyses/rnaseq/2b_topgenes_annotations/REVIGO_",arch, ".tsv"))
+}
+
+## GOsummaries and cloud plots
+gs_arch <- list()
+for (arch in archetypes) {
+  gs_arch[[arch]] <- topgenes %>%
+    dplyr::filter(Archetype==arch) %>%
+    dplyr::select(HGNC.ID) %>%
+    GOsummaries::gosummaries() %>%
+    GOsummaries::add_to_slot.gosummaries("Title", list(arch))
+}
+
+for (arch in archetypes) {
+  plot(gs_arch[[arch]],filename=paste0("analyses/rnaseq/2b_topgenes_annotations/GOcloud_",arch,".pdf"))
+}
+```
+
+# Cell specificity for top genes
+
+Following Nikil's 6a_submodule_annotation.Rmd
+Cell type markers in the brain are taken from McKenzie et al. (Supplemental File 1, DOI:10.1038/s41598-018-27293-5). The study developed three different metrics to rank the relation of genes to specific cell types (enrichment, expression, specificity). 
+The cell specificity for a given gene is the minimum log fold change when pairwise comparing the expression of the gene in the given cell type with the expression of the gene in all other cell types.
+Here I'm using cell specificity score to annotate the top genes of each archetype, with chi-square to test for biased representations of any cell type in any archetype, and a plot of deviations from expectation for visualization.
+
+```{r cell_specificity}
+
+archetypes <- sort(unique(topgenes$Archetype))
+#NUM.MARKERS = 100
+
+# split topgenes into a list of gene sets by archetype
+gene.sets <- split(topgenes, topgenes$Archetype, drop=TRUE) %>%
+  lapply(function(l){dplyr::select(l, HGNC.ID)})
+
+cell.types <- c("Astroctyes", "Endothelial", "Microglia", "Neurons", "Oligodendrocytes")
+
+hum.specific <- split(hum.specific, hum.specific$Celltype, drop=TRUE) %>%
+  lapply(function(l){dplyr::select(l, HGNC.ID=gene, Grand.Mean=grand_mean)})
+names(hum.specific) <- cell.types
+
+# Number of marker genes for each cell type in each archetype gene set
+specific.set <- sapply(archetypes, function(s) {
+  sapply(cell.types, function(ct) length(intersect(hum.specific[[ct]]$HGNC.ID, gene.sets[[s]]$HGNC.ID)), USE.NAMES=T)
+})
+
+names(dimnames(specific.set)) <- c("Cell Type", "Archetype")
+chisq.test(specific.set)
+assoc(t(specific.set), shade=TRUE,labeling_args = list(abbreviate_labs = c(6, 9)))
+
+pdf(file = "analyses/rnaseq/2b_topgenes_annotations/cellTypes.pdf")
+assoc(t(specific.set), shade=TRUE,labeling_args = list(abbreviate_labs = c(6, 9)))
+dev.off()
+#
+```
+
+# Output
+```{r, cache=FALSE}
+saveRDS(topgenes, "analyses/rnaseq/2b_topgenes_annotations/topgenes.anno.RDS")
+saveRDS(all.go, file="analyses/rnaseq/2b_topgenes_annotations/all.GO_archetypes.RDS")
+```
+
+# Session info
+```{r session-info, cache = FALSE}
+devtools::session_info()
+```

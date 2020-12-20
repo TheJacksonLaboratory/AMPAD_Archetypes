@@ -1,0 +1,25 @@
+# Ignore everything in the root dir except
+.Rproj.user
+.Rproj
+.Rprofile
+.RData
+
+attic/
+data/
+docs/NM
+renv/
+
+# Ignore everything in any subdir that ends with
+**/*.RData
+**/*.RDS
+**/*.csv
+**/*.tsv
+**/*.txt
+**/*.ps
+**/*.log
+**/*.reml
+**/*.DS_Store
+**/*.Rhistory
+
+**/*_cache/
+**/*_files/

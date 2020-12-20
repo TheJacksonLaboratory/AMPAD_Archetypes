@@ -1,0 +1,390 @@
+---
+title: "Mouse-Human Comparison"
+author: "Ravi Pandey"
+date: "4/16/2019"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Loading R libraries
+
+```{r Library, message=FALSE, warning=FALSE}
+library(reshape2)
+library(corrplot)
+library("AnnotationDbi")
+library("org.Mm.eg.db")
+library(xlsx)
+library(UpSetR)
+library(grid)
+library(sva)
+```
+
+#### Extracting gene symbol from each mouse module generated through WGCNA analysis and storing into a vector of same module name
+```{r loadingData}
+mouse <- read.csv("/Users/pandera/Manuscript/Manuscript_v2/RNA-seqAnalysis/results/modinfo.csv")
+mmod <- unique(mouse$modulecolor)
+listMM <- list()
+for (i in mmod)
+{
+  x <- mouse[(mouse$modulecolor==i),]$SYMBOL
+  x <- x[!is.na(x)]
+  x <-as.character(x)
+  name <- paste(i,"_mod", sep = "")
+  listMM[[name]] <- x
+  assign(paste(i,"_mod", sep = ""),x)
+}
+
+# extracting gene symbol from each AMP-AD module and storing into a into a vector of same module name
+AMPAD <- read.csv("/Users/pandera/Manuscript/Manuscript_v2/RNA-seqAnalysis/data/AMPAD_humanmodules.csv")
+hmod <- unique(AMPAD$Module)
+listHM <- list()                
+for (i in hmod)
+{
+  x <- AMPAD[(AMPAD$Module==i),]$Mouse_gene_name
+  x <- x[!is.na(x)]
+  x <- as.character(x)
+  name <- paste(i,"_mod", sep = "")
+  listHM[[name]] <- x
+  assign(paste(i,"_mod", sep = ""),x)
+}
+```
+
+####Measuring Jaccard indices between Mouse and Human modules
+
+```{r}
+file.remove("/Users/pandera/Manuscript/Manuscript_v2/RNA-seqAnalysis/results/JACARD_MouseHuman.txt")
+for (j in 1:length(listMM))
+{
+  for (k in 1:length(listHM))
+  {
+    I <- length(intersect(listMM[[j]],listHM[[k]]))
+    JACARD <- I/(length(listMM[[j]])+length(listHM[[k]])-I)
+    df <- data.frame(names(listMM)[j],length(listMM[[j]]),names(listHM)[k],length(listHM[[k]]),I,JACARD)
+    write.table(df, file = "/Users/pandera/Manuscript/Manuscript_v2/RNA-seqAnalysis/results/JACARD_MouseHuman.txt", append = TRUE, sep = "\t", row.names=FALSE,
+                col.names=FALSE, quote=FALSE)
+  }
+}
+
+jaccard.mouse.human <- read.table("/Users/pandera/Manuscript/Manuscript_v2/RNA-seqAnalysis/results/JACARD_MouseHuman.txt")
+jaccard.mouse.human <- jaccard.mouse.human[order(-jaccard.mouse.human[,6]),]  #sort based on Jaccard indices
+```
+
+###Randomization TO CALCULATE P-VALUE
+Significance of Jaccard index for each pair of mouse-human modules overlap were calculated by performing random sampling 
+of genes for each  mouse modules (10,000 trials) from the actual gene list from all mouse modules and calculate Jaccard index against same human modules. This step can take 3-4 hours. 
+```{r}
+#file.remove("/Users/pandera/Manuscript/Manuscript_v2/RNA-seqAnalysis/results/JACARD_MouseHuman_random.txt")
+#mmod <- unique(mouse$modulecolor)
+#for(z in 1:10000){
+#  df2 <- transform(mouse, SYMBOL = sample(SYMBOL) )
+#  listR <- list()
+#  for (i in mmod)
+#  {
+#    ff <- df2[(df2$modulecolor==i),]$SYMBOL
+#    ff <- ff[!is.na(ff)]
+#    ff2 <- as.character(ff)
+#    name <- paste(i,"_mod", sep = "")
+#    listR[[name]] <- ff2
+#    assign(paste(i,"_mod", sep = ""),ff2)
+#  }
+  
+#  for (j in 1:length(listR))
+#  {
+#    for (k in 1:length(listHM))
+#    {
+#      I <- length(intersect(listR[[j]],listHM[[k]]))
+#      JACARD <- I/(length(listR[[j]])+length(listHM[[k]])-I)
+#      df <- data.frame(names(listR)[j],length(listR[[j]]),names(listHM)[k],length(listHM[[k]]),I,JACARD)
+#      write.table(df, file = "/Users/pandera/Manuscript/Manuscript_v2/RNA-seqAnalysis/results/JACARD_MouseHuman_random.txt", append = TRUE, sep = "\t", row.names=FALSE,
+#                  col.names=FALSE, quote=FALSE)
+#    }
+#  }
+#}
+```
+
+###Significance of JACCARD Indices
+```{r}
+#The calculation of the p-value for the Jaccard indices based on an empirical sampling distribution from above 10,000 trials.  
+
+mh_overlap <- read.table("/Users/pandera/Manuscript/Manuscript_v2/RNA-seqAnalysis/results/JACARD_MouseHuman.txt")
+mh_overlap_random <- read.table("/Users/pandera/Manuscript/Manuscript_v2/RNA-seqAnalysis/results/JACARD_MouseHuman_random.txt")
+for (i in 1:length(mh_overlap$V1))
+{
+  
+  x <- mh_overlap_random[(mh_overlap_random$V1==mh_overlap$V1[i]) & (mh_overlap_random$V3== mh_overlap$V3[i]),]
+  jaccard <- x[,6]
+  ecdf_jaccard <- ecdf(jaccard)
+  mh_overlap$jaccard_pvalue[i] <- 1- ecdf_jaccard(mh_overlap[i,]$V6)
+}
+
+
+colnames(mh_overlap) <- c('Mouse.Module', "MSize", 'Human.Module', "HSize","I",'JACARD',"p-value")
+write.csv(mh_overlap, file="/Users/pandera/Manuscript/Manuscript_v2/RNA-seqAnalysis/results/JACARD_mm_HS_overlap.csv")
+write.xlsx(mh_overlap, file="/Users/pandera/Manuscript/Manuscript_v2/RNA-seqAnalysis/results/Mouse_Human_JaccardSimilarity.xlsx")
+```
+
+###Figure 3A -  Correlation between Mouse modules and Mouse strains
+```{r fig.height=9}
+#loading module eigene gene expression of each module in each strain
+load("/Users/pandera/Manuscript/Manuscript_v2/RNA-seqAnalysis/results/mm-02-networkConstruction-stepByStep.RData")
+ME_data <- MEs
+colnames(ME_data) <- gsub("ME","",colnames(ME_data))
+ME_data$Strains <- c(rep("ApoE4", 6),rep("ApoE-KO", 5),rep("B6", 6),rep("Bin1", 6),rep("Cd2ap", 6),rep("Clu", 6),rep("APP", 5),rep("B6", 7))
+ME_data$Sample <- ME_data$X
+ME_data$group <- c(rep("ApoE4", 6),rep("ApoE-KO", 5),rep("AA", 6),rep("Bin1", 6),rep("Cd2ap", 6),rep("Clu", 6),rep("APP", 5),rep("AA", 7))
+
+
+#Including mouse modules that is significantly driven by atleast one mouse strain identified from ANOVA and TUKEY-HSD test.
+mouse.mod <- c("ivory","skyblue3","orange", "darkorange2","darkorange","lightgreen", "lightyellow","black","brown","brown4","lightcyan1","plum1","steelblue")
+
+## Generating correlation matrix using module eigengene expressionn of each module for each strain as correlation measure
+DS <- data.frame()
+for (name1 in mouse.mod)
+{
+  d <-  aggregate(ME_data[[name1]] ~  Strains,  ME_data,mean)
+  DS <- rbind(DS,d)
+}
+DS2 <- as.data.frame(matrix(DS[,2],byrow=FALSE,ncol=13))
+rownames(DS2) <- c("APOE","APOEe4","APP/PS1","B6", "BIN1", "CD2AP", "CLU")
+
+colnames(DS2) <- mouse.mod
+DS3 <- DS2[-4,]                                     #removing contol mice data
+rownames(DS3) <- c("APOE","APOEe4","APP/PS1", "BIN1", "CD2AP", "CLU")
+
+## Generating p-value matrix of module eigengene expressionn of each module for each strain
+PS <- data.frame()
+for (name1 in mouse.mod)
+{
+  pp = aov(ME_data[[name1]] ~ group, data = ME_data)
+  v1 <- as.data.frame(TukeyHSD(pp)$group[(1:6),4])
+  PS <- rbind(PS,v1)
+}
+PS2 <- as.data.frame(matrix(PS[,1],byrow=FALSE,ncol=13))
+rownames(PS2) <- c("APOE","APOEe4","APP/PS1","BIN1", "CD2AP", "CLU")
+colnames(PS2) <- mouse.mod
+
+#corrplot showing mouse module significant driven by at least one of the mouse strain
+#png("/Users/pandera/Manuscript/Manuscript_v2/RNA-seqAnalysis/figures/Fig3A_GWAS_MOUSEMOD_eigengenecorrelation_signifant.png",pointsize=14, res=600, width =4, height=6,units="in")
+corrplot(as.matrix(t(DS3)),  order = "original",p.mat = as.matrix(t(PS2)), sig.level = 0.05,insig="blank",is.corr=FALSE,cl.length=3,
+         tl.col = "black",cl.align.text="l",cl.pos="b",tl.cex=0.9,cl.lim = c(-0.5,0.5))
+#dev.off()
+```
+
+###Figure 3B : Correlation plot between Significant Mouse modules and AMP-AD modules based on jaccard indices
+```{r fig.height=9,fig.width=12}
+jaccard <- read.csv("/Users/pandera/Manuscript/Manuscript_v2/RNA-seqAnalysis/results/JACARD_mm_HS_overlap.csv",header = T)
+jaccard <- jaccard[,-1]
+jaccard$Mouse.Module <- gsub("_mod","",jaccard$Mouse.Module)
+jaccard$Human.Module <- gsub("_mod","",jaccard$Human.Module)
+mod <- c("TCXblue","PHGyellow","IFGyellow","DLPFCblue","CBEturquoise","STGblue","PHGturquoise","IFGturquoise","TCXturquoise","FPturquoise","IFGbrown","STGbrown"
+         ,"DLPFCyellow","TCXgreen","FPyellow","CBEyellow","PHGbrown","DLPFCbrown",
+         "STGyellow","PHGgreen","CBEbrown","TCXyellow","IFGblue","FPblue","FPbrown","CBEblue","DLPFCturquoise","TCXbrown","STGturquoise","PHGblue")
+
+mouse.mod <- c("ivory","skyblue3","orange", "darkorange2","darkorange","lightgreen", "lightyellow","black","brown","brown4","lightcyan1","plum1","steelblue")
+
+df <- data.frame()
+df2 <- data.frame()
+for (name1 in mouse.mod)
+{
+  for (i in mod){
+    d <- jaccard[(jaccard$Mouse.Module %in% name1) & (jaccard$Human.Module %in% i),][,6]
+    df <- rbind(df,d)
+    d2 <- jaccard[(jaccard$Mouse.Module %in% name1) & (jaccard$Human.Module %in% i),][,7]
+    df2 <- rbind(df2,d2)
+  }
+}
+jaccard.score <- as.data.frame(matrix(df[,1],byrow=FALSE,ncol=13))
+rownames(jaccard.score) <- mod
+colnames(jaccard.score) <- mouse.mod
+#jaccard.score <- jaccard.score[-c(31:32),]                              #removed the EOAD patients data from analysis
+
+jaccard.pvalue <- as.data.frame(matrix(df2[,1],byrow=FALSE,ncol=13))
+rownames(jaccard.pvalue) <- mod
+colnames(jaccard.pvalue) <- mouse.mod
+#jaccard.pvalue <- jaccard.pvalue[-c(31:32),]                            #removed the EOAD patients data from analysis
+
+#png("/Users/pandera/Manuscript/Manuscript_v2/RNA-seqAnalysis/figures/Fig3B_GWAS_AMPAD_Jaccardcorrelation_significant.png",pointsize=14, res=600, width =12, height=8,units="in")
+corrplot(as.matrix(t(jaccard.score)),  order = "original",p.mat = as.matrix(t(jaccard.pvalue)), sig.level = 0.05,insig="blank",is.corr=FALSE,cl.length=3,
+         tl.col = "black")
+#dev.off()
+```
+
+####FIGURE 4:OVERLAP BETWEEN IVORY AND BROWN MOUSE MODULES WITH IMMUNE AND NEURONAL SYSTEM ASSOCIATED AMP-AD MODULES IN CONSENSUS CLUSTERS B AND C RESPECTIVELY 
+```{r fig.width=12,fig.height=9}
+##plot overlap set using UpSetR pacakage
+
+mouse <- read.csv("/Users/pandera/Manuscript/Manuscript_v2/RNA-seqAnalysis/results/modinfo.csv")
+mmod <- unique(mouse$modulecolor)
+listMM <- list()
+for (i in mmod)
+{
+  x <- mouse[(mouse$modulecolor==i),]$SYMBOL
+  x <- x[!is.na(x)]
+  x <-as.character(x)
+  name <- paste(i,"_mod", sep = "")
+  listMM[[name]] <- x
+  assign(paste(i,"_mod", sep = ""),x)
+}
+
+# extracting gene symbol from each AMP-AD module and storing into a list
+AMPAD <- read.csv("/Users/pandera/Manuscript/Manuscript_v2/RNA-seqAnalysis/data/AMPAD_humanmodules.csv")
+hmod <- unique(AMPAD$Module)
+listHM <- list()                
+for (i in hmod)
+{
+  x <- AMPAD[(AMPAD$Module==i),]$Mouse_gene_name
+  x <- x[!is.na(x)]
+  x <- as.character(x)
+  name <- paste(i,"_mod", sep = "")
+  listHM[[name]] <- x
+  assign(paste(i,"_mod", sep = ""),x)
+}
+
+## Overlap of ivory mouse module with AMPAD immune system modules in Consensus Cluster B
+ivory_immune_mods <- list('Mouse ivory' = ivory_mod, IFGturquoise = IFGturquoise_mod, CBEturquoise = CBEturquoise_mod, TCXturquoise= TCXturquoise_mod,
+          PHGturquoise=PHGturquoise_mod,FPturquoise=FPturquoise_mod,STGblue=STGblue_mod,DLPFCblue=DLPFCblue_mod)
+
+#png("/Users/pandera/Manuscript/Manuscript_v2/RNA-seqAnalysis/figures/Fig4A_ivory_overlap_upsetR.png",pointsize=12, res=300, width =15, height=9,units="in")
+upset(nsets=8,fromList(ivory_immune_mods), order.by = "freq", point.size=3,text.scale=c(3, 3, 2, 2, 2.4, 1.8),sets.bar.color =c("grey23","grey23","grey23","grey23","grey23","grey23","grey23","blue"),
+      queries = list(list(query = intersects, params = list("Mouse ivory","IFGturquoise","PHGturquoise","TCXturquoise","CBEturquoise","FPturquoise","DLPFCblue","STGblue" ),color="red",active=T)))
+grid.text("A",x = 0.05, y=0.95, gp=gpar(fontsize=28,fontface="bold"))
+#dev.off()   
+
+### Overlap of brown mouse module with AMPAD neuronal system modules in Consensus Cluster B
+
+brown_neuronal_mods <- list('Mouse brown'=brown_mod,CBEyellow=CBEyellow_mod,FPyellow=FPyellow_mod,IFGbrown=IFGbrown_mod,STGbrown=STGbrown_mod,
+           PHGbrown=PHGbrown_mod,TCXgreen=TCXgreen_mod,DLPFCyellow=DLPFCyellow_mod)
+
+#png("/Users/pandera/Manuscript/Manuscript_v2/RNA-seqAnalysis/figures/Fig4B_brown_overlap_upsetR2.png",pointsize=12, res=300, width =15, height=9,units="in")
+upset(nsets=8,fromList(brown_neuronal_mods), sets= c("IFGbrown","FPyellow","STGbrown","DLPFCyellow" ,"TCXgreen","PHGbrown","CBEyellow","Mouse brown"),sets.bar.color =c("grey23","grey23","grey23","grey23","grey23","grey23","grey23","blue"),keep.order = TRUE,order.by = "freq", point.size=3,text.scale=c(3, 3, 2, 2, 2.4, 1.8),
+      queries = list(list(query = intersects, params = list("Mouse brown","CBEyellow","FPyellow","IFGbrown","STGbrown", "PHGbrown","TCXgreen","DLPFCyellow" ),color="red",active=T)))
+#grid.text("B",x = 0.05, y=0.95, gp=gpar(fontsize=28,fontface="bold"))
+dev.off()
+
+```
+
+
+###Correlation between Mouse models and 30 AMP-AD modules 
+```{r}
+##Reading Mouse and Human modules expression data
+
+mydat1 <- read.table("/Users/pandera/Manuscript/Manuscript_v2/RNA-seqAnalysis/data/TPM_app_wt.txt",header=T)
+mydat2 <- read.table("/Users/pandera/Manuscript/Manuscript_v2/RNA-seqAnalysis/data/TPM_GWAS.txt",header=T)
+dd <- merge(mydat2,mydat1, by="gene_id")
+row.names(dd) <-  dd[,1]
+alldat <- dd[,-c(1)]
+alldat2 <- alldat[ rowSums((alldat>0.5))>5, ]
+mydat <- log2(alldat2 +1)
+
+
+#We implemented combat to remove known batch effect in data. All GWAS mouse model samples were from one batch, while 1 APP and 7 WT were from second batch and 4 APP mouse model sample were from different batch.
+
+samplename <- colnames(mydat)
+batchname <- factor(c(rep("A", 36),rep("B", 1),rep("c", 4),rep("B",7)))
+samplegroup <- factor(c(rep("ApoE4", 6),rep("ApoE-KO", 6),rep("B6", 6),rep("Bin1", 6),rep("Cd2ap", 6),
+                        rep("Clu", 6),rep("APP", 5),rep("B6", 7)))
+pheno <- data.frame(samplename,subgroups=samplegroup, batch=batchname)
+batch = pheno$batch
+
+modcombat<-model.matrix(~1, data=pheno) 
+combat_mydata= ComBat(dat=mydat, batch=batch, mod=modcombat, par.prior=TRUE,prior.plots=FALSE)
+
+#adding gene name in batch corrected data
+genename <- read.csv("/Users/pandera/Manuscript/Manuscript_v2/RNA-seqAnalysis/data/mouse_id_gene.csv",row.names = 1)
+combat_mydata.genename <- merge(combat_mydata,genename,by=0)
+row.names(combat_mydata.genename) <- combat_mydata.genename[,1]
+combat_mydata.genename[,1] <- NULL
+combat_mydata.genename <- combat_mydata.genename[,c(49,1:48)]
+combat_mydata.genename <- na.omit(combat_mydata.genename)
+dim(combat_mydata.genename)
+
+#transforming data to fit linear model
+combat_mydata.transform <- melt(combat_mydata.genename)
+colnames(combat_mydata.transform ) <- c("Genes","Sample","intensity")
+
+#merging transform data with model design
+design <- read.csv("/Users/pandera/Manuscript/Manuscript_v2/RNA-seqAnalysis/data/lm_design_gwas.csv")[,-1]
+gwas.model <- merge(combat_mydata.transform ,design,by.x="Sample",by.y="sample")
+```
+
+# Reading log Fold change expression of genes in AMP-AD modules
+```{r}
+#https://www.synapse.org/#!Synapse:syn11180450
+DE_human <- read.table("/Users/pandera/Manuscript/NanostringPaper/analysis/data/differentialExpressionSummary.tsv", sep = '\t', header = TRUE)
+DE_human2 <- DE_human[DE_human$Model=="Diagnosis" & DE_human$Comparison=="AD-CONTROL",]
+# extracting log fold change expression of genes in each tissue
+DH <- DE_human2[,c(2,4,5)]
+colnames(DH) <- c("brainRegion","GeneID","logFC")
+
+# READING AMP-AD human coexpression modules and extracting columns relevant to this analysis
+AMPAD.MOD <- read.csv("/Users/pandera/Manuscript/Manuscript_v2/RNA-seqAnalysis/data/AMPAD_humanmodules.csv")
+AMPAD_GENEEXP <- merge(AMPAD.MOD,DH,by=c("brainRegion","GeneID"))[,c(1,2,5,8,9,10,13)]
+
+mod <- c("TCXblue","PHGyellow","IFGyellow","DLPFCblue","CBEturquoise","STGblue","PHGturquoise","IFGturquoise","TCXturquoise","FPturquoise","IFGbrown","STGbrown","DLPFCyellow","TCXgreen","FPyellow","CBEyellow","PHGbrown","DLPFCbrown","STGyellow","PHGgreen","CBEbrown","TCXyellow","IFGblue","FPblue","FPbrown","CBEblue","DLPFCturquoise","TCXbrown","STGturquoise","PHGblue")
+
+```
+
+###Fitting linear model for each genotype factor
+```{r}
+GeneID <- as.character(unique(gwas.model$Genes))
+corr.data <- data.frame()
+for (i in 1:length(GeneID)){
+  X <- gwas.model[gwas.model$Genes %in% GeneID[i],]
+  fit <- lm(intensity ~ Apoe4  + Bin1 + Clu + Cd2ap + APP + APOE4.KO , data=X)
+  summary(fit)
+  beta <- summary(fit)$coef[,"Estimate",drop=F]
+  pval <- log(summary(fit)$coef[,"Pr(>|t|)",drop=F],10)
+  z <- cbind(beta,pval,GeneID[i])
+  corr.data <- rbind(corr.data,z)
+}
+colnames(corr.data) <- c("Beta", "pval","Gene")
+corr.data$covariates <- gsub("^\\d+|\\d+$", "", rownames(corr.data))
+write.csv(corr.data,file="/Users/pandera/Manuscript/Manuscript_v2/RNA-seqAnalysis/results/GWAS_CorrelationData.csv")
+```
+
+###Correlation with AMP-AD modules of regresion coffeiecnt from each mouse model.
+
+```{r fig.width=12,fig.height= 8}
+corr.data <- read.csv("/Users/pandera/Manuscript/Manuscript_v2/RNA-seqAnalysis/results/GWAS_CorrelationData.csv")[,c(4,5,2)]
+corr.data.transform <- dcast(corr.data,Gene~covariates)
+
+df <- data.frame()
+df1 <- data.frame()
+for (j in 3:8){
+  g12 <-corr.data.transform[, c(1,j)]
+  for (i in mod){
+    f12 <- AMPAD_GENEEXP[AMPAD_GENEEXP$Module==i,][,c(6,7)]
+    colnames(f12) <- c("Gene","logFC")
+    tt <- merge(g12,f12,by="Gene")
+    tt = tt[!duplicated(tt$Gene),]
+    tt2 <- na.omit(tt)
+    rownames(tt2) <- tt2$Gene
+    tt3 <- tt2[,-1]
+    #tt3 <- na.omit(tt2)
+    df <- rbind(df,cor.test(tt3[,1],tt3[,2],method = "pearson")$estimate)
+    df1 <- rbind(df1,cor.test(tt3[,1],tt3[,2],method = "pearson")$p.value)
+  }
+}
+df2 <- as.data.frame(matrix(df[,1],byrow=FALSE,ncol=6))
+rownames(df2) <- mod
+colnames(df2) <- c("APOEe4","APOE","APP/PS1","BIN1", "CD2AP", "CLU")
+
+df11 <- as.data.frame(matrix(df1[,1],byrow=FALSE,ncol=6))
+rownames(df11) <- mod
+colnames(df11) <-  c("APOEe4","APOE","APP/PS1","BIN1", "CD2AP", "CLU")
+df2_All <- df2
+df11_All <- df11
+
+
+colnames(df2_All) <- c("            ")
+#png("/Users/pandera/Manuscript/Manuscript_v2/RNA-seqAnalysis/figures/Fig5_GWAS_AMPAD_correlation_Allage_new.png",pointsize=14, res=600, width =9, height=6,units="in")
+corrplot(as.matrix(t(df2_All)),  order = "original",p.mat = as.matrix(t(df11_All)), sig.level = 0.05,insig="blank",is.corr=FALSE,cl.length=3,cl.lim=c(-0.3,0.3),tl.col = "black")
+text(-1.5, 6:1, expression(paste(italic("Apoe"),epsilon,4),italic("Apoe"^'-/-'),italic("App/Psen1"),italic("Bin1"^'+/-'), italic("Cd2ap"^'+/-'), italic("Clu"^'-/-')))
+#dev.off()
+```
+
+
+

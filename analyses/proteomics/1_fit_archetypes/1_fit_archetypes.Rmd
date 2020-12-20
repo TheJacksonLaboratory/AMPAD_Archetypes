@@ -1,0 +1,709 @@
+---
+title: "1 Fitting Archetypes to ROSMAP proteomics (TMT) data"
+author: "Annat Haber"
+date: '`r Sys.Date()`'
+output:
+  html_document:
+    toc: true
+    toc_depth: 4
+    code_folding: hide
+---
+
+```{r setup, warning=FALSE, message=FALSE}
+knitr::opts_knit$set(root.dir = rprojroot::find_rstudio_root_file())
+knitr::opts_chunk$set(cache=TRUE, cache.extra = R.version)
+reticulate::use_condaenv("reticulate_PCHA", conda = "auto", required = TRUE)
+```
+
+https://vitkl.github.io/ParetoTI/
+```{r libaries, warning=FALSE, message=FALSE}
+suppressPackageStartupMessages({
+  library(ParetoTI)
+  library(ggplot2)
+  library(ggfortify)
+  library(cowplot)
+  library(Matrix)
+  library(tidyverse)
+  library('biomaRt')
+  library('clusterProfiler')
+  library(vegan)
+
+})
+
+#source("scripts/utils/human2mouseHGNC.R")
+
+```
+
+# Preparing data and metadata
+Loading data from Emory (A & T Wingo) and metadata downloaded directly from synapse, as well as Nikhil's subtypes.  
+Merging it all together and creating a new diagnosis variable that combines cogdx, braak, and cedar scores based on syn8456629  
+Dementia that isn't MCI or AD (cogdx=6) is removed so that "Other" includes only MCI
+```{r load_data, warning=FALSE, message=FALSE}
+# Nikhil's subtypes
+subtypes <- readRDS("data/milind2019/rosmap_patient_subtypes.RDS") %>% 
+  arrange(Patient)
+rownames(subtypes) <- subtypes$Patient
+
+# Proteomics data from T&A Wingo
+prot <- read_csv("data/proteomics_n391_residual_log2_batchMSsexPMIageStudy.csv") %>% 
+  column_to_rownames("X1") %>%
+  t()
+
+# key between proteomics ID and project ID (from T&A Wingo)
+protid <- read_csv("data/metadata/proteomics_ROS_MAP_TRAITS_clean.csv") %>% 
+  dplyr::select(-Batch) %>%
+  dplyr::filter(proteomicsid%in%rownames(prot))
+
+# Clinical (covariates) data syn3191087
+meta.cl <- read_csv("data/metadata/ROSMAP_clinical_2019-05_v3.csv")
+
+# syn3382527 to match patients id's
+key <- read_csv("data/metadata/ROSMAP_IDkey.csv") %>% 
+  dplyr::select(projid, rnaseq_id, wgs_id) %>%
+  merge(protid, by="projid", all=TRUE) %>%
+  filter(proteomicsid %in% rownames(prot)) %>%
+  filter(!duplicated(projid))
+
+meta <- merge(key, meta.cl, by = "projid", all=FALSE) %>%
+  merge(subtypes, by.x="rnaseq_id", by.y="Patient", all.x=TRUE, all.y=FALSE) %>% # adding Nikil's subtyppes info
+  arrange(proteomicsid) # same order as data
+  
+# combined diagnosis based on syn8456629
+# Remove dementia that isn't MCI or AD (cogdx=6) so that "Other" includes only MCI
+meta <- meta %>% 
+  dplyr::filter(cogdx!=6) %>%
+  mutate(diagnosis = if_else(cogdx == 4 & braaksc >= 4 & ceradsc <= 2, "AD", 
+                             if_else(cogdx == 1 & braaksc <= 3 & ceradsc >= 3, "Control", "MCI") ))
+# Same as diagnosis from Nikil's work (syn11024258)
+# meta %>% dplyr::filter(diagnosis=="AD") %>% dplyr::select(Subtype) %>% unique()
+# meta %>% dplyr::filter(diagnosis=="Control") %>% dplyr::select(Subtype) %>% unique()
+
+# Remove proteins with missing data
+# 17% of proteins have >20% missing data; 8% of samples are missing >20%
+# 4065 proteins with any missing data
+data <- prot[meta$proteomicsid,]
+naic <- unique(which(is.na(data), arr.ind=T)[,2]) 
+data <- data[,-naic]
+
+# Labels for plotting below
+labels <- as.character(meta$diagnosis)
+names(labels) <- meta$proteomicsid
+labels[meta$Subtype=="A"] <- "A"
+labels[meta$Subtype=="B"] <- "B"
+
+```
+
+# PCA for all samples
+There is almost complete overlap between AD, Control, and MCI, with MCI being more spread out than AD and Control.  
+It takes 206 PC's to cover 80% of the variance.  
+The first ~23 PC's are above random based on the broken stick model, covering together 25% of the variance.
+```{r pca_all}
+pc <- prcomp(data)
+
+#pdf("output/1_fit_archetypes/PCAscreeplot_bs.pdf", width=6, height=7)
+p1 <- screeplot(pc, bstick=TRUE, npcs = 35, main=NULL) # First ~23 PC's are above random
+rel.ev <- pc$sdev/sum(pc$sdev) # proportion of variance explained
+e8 <- which(cumsum(rel.ev)>0.8)[1] # it takes 206 PC's to cover 80% of the variance
+plot(cumsum(rel.ev), ylab="Cumulative proportion of explained variance")
+segments(0,0.8,e8,0.8, col="red", lty=4)
+segments(e8,0.8,e8,0, col="red", lty=4)
+#dev.off()
+
+autoplot(pc, data = meta, colour = 'diagnosis')
+
+```
+
+# Comparing polytopes {.tabset .tabset-fade .tabset-pills}
+Fitting polytopes with a different number of vertices (from k=2 to k=6) using Principal Convex Hull Algorithm.  
+Comparing different numbre of PC's (p=20 covering 17% and p=400 covering 80% of the variance), with and without MCI and Control samples.  
+200 bootstraps were generated for each space, and archetype position recalculated, indicated in the scatterplots as empty (green) dots.  
+For subsequent analyses, archetype position is calculated as the mean of the bootstrapped scores around each archetype.  
+## AD only {.tabset .tabset-fade .tabset-pills}
+### 23 PC's (25%) {.tabset .tabset-fade .tabset-pills}
+```{r}
+p=23
+cases <- meta$proteomicsid[meta$diagnosis == "AD"]
+pcs4arch <- t(pc$x[cases,1:p])
+```
+Variance explained by different polytopes:
+```{r varianceExplained_p23_AD, warning=FALSE, message=FALSE, results='hold'}
+arc_ks = k_fit_pch(pcs4arch, ks = 2:6, check_installed = T,
+                   bootstrap = T, bootstrap_N = 200, maxiter = 1000,
+                   bootstrap_type = "s", seed = 2543, 
+                   volume_ratio = "none", # set to "none" if too slow
+                   delta=0, conv_crit = 1e-04, order_type = "align",
+                   sample_prop = 0.75)
+
+p1 <- plot_arc_var(arc_ks, type = "varexpl", point_size = 2, line_size = 1.5) + theme_bw()
+p2 <- plot_arc_var(arc_ks, type = "res_varexpl", point_size = 2, line_size = 1.5) + theme_bw()
+p3 <- plot_arc_var(arc_ks, type = "total_var", point_size = 2, line_size = 1.5) +
+  theme_bw() +
+  ylab("Mean variance in position of vertices") # look for the highest k that gives reasonably low variance
+p1
+p2
+p3
+rm(list=c("p1", "p2", "p3", "arc_ks"))
+```
+
+#### Fitting a line (k=2)
+```{r fit_archetypes_k2p23_AD, warning=FALSE, message=FALSE}
+k=2
+arcfit <- fit_pch_bootstrap(pcs4arch, n = 200, sample_prop = 0.75, seed = 235,
+                          noc = k, delta = 0, conv_crit = 1e-04, type = "cmq")
+
+# empty points are bootstrapped data showing variance around each archetype 
+plot_arc(arc_data = arcfit, data = pcs4arch, 
+                 which_dimensions = 1:2, line_size = 1.5,
+                 data_lab = labels[cases],
+                 text_size = 6, data_size = 3 
+                 )
+
+pl3 = plot_arc(arc_data = arcfit, data = pcs4arch, 
+                which_dimensions = 1:3, line_size = 1.5,
+                text_size = 24, data_size = 3,
+                data_lab = labels[cases]
+                  #colors= palette(rainbow(6))
+                 ) 
+
+rm("arcfit")
+```
+#### Fitting a triangle (k=3)
+```{r fit_archetypes_k3p23_AD, warning=FALSE, message=FALSE}
+k=3
+arcfit <- fit_pch_bootstrap(pcs4arch, n = 200, sample_prop = 0.75, seed = 235,
+                          noc = k, delta = 0, conv_crit = 1e-04, type = "cmq")
+
+# empty points are bootstrapped data showing variance around each archetype 
+plot_arc(arc_data = arcfit, data = pcs4arch, 
+                 which_dimensions = 1:2, line_size = 1.5,
+                 data_lab = labels[cases],
+                 text_size = 6, data_size = 3 
+                 )
+
+pl3 = plot_arc(arc_data = arcfit, data = pcs4arch, 
+                which_dimensions = 1:3, line_size = 1.5,
+                text_size = 24, data_size = 3,
+                data_lab = labels[cases]
+                  #colors= palette(rainbow(6))
+                 ) 
+
+```
+
+#### Fitting a rectangle (k=4)
+```{r fit_archetypes_k4p23_AD, warning=FALSE, message=FALSE}
+k=4
+arcfit <- fit_pch_bootstrap(pcs4arch, n = 200, sample_prop = 0.75, seed = 235,
+                          noc = k, delta = 0, conv_crit = 1e-04, type = "cmq")
+
+# empty points are bootstrapped data showing variance around each archetype 
+plot_arc(arc_data = arcfit, data = pcs4arch, 
+                which_dimensions = 1:3, line_size = 1.5,
+                text_size = 24, data_size = 3,
+                data_lab = meta[meta$proteomicsid%in%cases, "diagnosis"]
+                  #colors= palette(rainbow(6))
+                 ) 
+
+p_pca = plot_arc(arc_data = arcfit, data = pcs4arch, 
+                 which_dimensions = 1:2, line_size = 1.5,
+                 data_lab = meta[meta$proteomicsid%in%cases, "diagnosis"],
+                 text_size = 6, data_size = 3 
+                 )
+rm("arcfit")
+```
+
+### 206 PC's (80%) {.tabset .tabset-fade .tabset-pills}
+```{r}
+p=206
+cases <- meta$proteomicsid[meta$diagnosis == "AD"]
+pcs4arch <- t(pc$x[cases,1:p])
+```
+Variance explained by different polytopes:
+```{r varianceExplained_p206_AD, warning=FALSE, message=FALSE, results='hold'}
+arc_ks = k_fit_pch(pcs4arch, ks = 2:6, check_installed = T,
+                   bootstrap = T, bootstrap_N = 200, maxiter = 1000,
+                   bootstrap_type = "s", seed = 2543, 
+                   volume_ratio = "none", # set to "none" if too slow
+                   delta=0, conv_crit = 1e-04, order_type = "align",
+                   sample_prop = 0.75)
+
+p1 <- plot_arc_var(arc_ks, type = "varexpl", point_size = 2, line_size = 1.5) + theme_bw()
+p2 <- plot_arc_var(arc_ks, type = "res_varexpl", point_size = 2, line_size = 1.5) + theme_bw()
+p3 <- plot_arc_var(arc_ks, type = "total_var", point_size = 2, line_size = 1.5) +
+  theme_bw() +
+  ylab("Mean variance in position of vertices") # look for the highest k that gives reasonably low variance
+p1
+p2
+p3
+rm(list=c("p1", "p2", "p3", "arc_ks"))
+```
+ 
+#### Fitting a line (k=2)
+```{r fit_archetypes_k2p206_AD, warning=FALSE, message=FALSE}
+k=2
+arcfit <- fit_pch_bootstrap(pcs4arch, n = 200, sample_prop = 0.75, seed = 235,
+                          noc = k, delta = 0, conv_crit = 1e-04, type = "cmq")
+
+# empty points are bootstrapped data showing variance around each archetype 
+plot_arc(arc_data = arcfit, data = pcs4arch, 
+                which_dimensions = 1:3, line_size = 1.5,
+                text_size = 24, data_size = 3,
+                data_lab = labels[cases]
+                 #colors= palette(rainbow(6))
+                ) 
+
+p_pca = plot_arc(arc_data = arcfit, data = pcs4arch, 
+                 which_dimensions = 1:2, line_size = 1.5,
+                 data_lab = labels[cases],
+                 text_size = 6, data_size = 3 
+                 )
+rm("arcfit")
+```
+
+#### Fitting a triangle (k=3)
+```{r fit_archetypes_k3p206_AD, warning=FALSE, message=FALSE}
+k=3
+arcfit <- fit_pch_bootstrap(pcs4arch, n = 200, sample_prop = 0.75, seed = 235,
+                          noc = k, delta = 0, conv_crit = 1e-04, type = "cmq")
+
+# empty points are bootstrapped data showing variance around each archetype 
+plot_arc(arc_data = arcfit, data = pcs4arch, 
+                which_dimensions = 1:3, line_size = 1.5,
+                text_size = 24, data_size = 3,
+                data_lab = meta[meta$proteomicsid%in%cases, "diagnosis"]
+                  #colors= palette(rainbow(6))
+                 ) 
+
+p_pca = plot_arc(arc_data = arcfit, data = pcs4arch, 
+                 which_dimensions = 1:2, line_size = 1.5,
+                 data_lab = meta[meta$proteomicsid%in%cases, "diagnosis"],
+                 text_size = 6, data_size = 3 
+                 )
+rm("arcfit")
+```
+
+#### Fitting a rectangle (k=4)
+```{r fit_archetypes_k4p206_AD, warning=FALSE, message=FALSE}
+k=4
+arcfit <- fit_pch_bootstrap(pcs4arch, n = 200, sample_prop = 0.75, seed = 235,
+                          noc = k, delta = 0, conv_crit = 1e-04, type = "cmq")
+
+# empty points are bootstrapped data showing variance around each archetype 
+plot_arc(arc_data = arcfit, data = pcs4arch, 
+                which_dimensions = 1:3, line_size = 1.5,
+                text_size = 24, data_size = 3,
+                data_lab = meta[meta$proteomicsid%in%cases, "diagnosis"]
+                  #colors= palette(rainbow(6))
+                 ) 
+
+p_pca = plot_arc(arc_data = arcfit, data = pcs4arch, 
+                 which_dimensions = 1:2, line_size = 1.5,
+                 data_lab = meta[meta$proteomicsid%in%cases, "diagnosis"],
+                 text_size = 6, data_size = 3 
+                 )
+rm("arcfit")
+```
+## AD + MCI {.tabset .tabset-fade .tabset-pills}
+### 23 PC's (25%) {.tabset .tabset-fade .tabset-pills}
+```{r}
+p=23
+cases <- meta$proteomicsid[meta$diagnosis %in% c("AD", "MCI")]
+pcs4arch <- t(pc$x[cases,1:p])
+```
+Variance explained by different polytopes:
+```{r varianceExplained_p23_ADMCI, warning=FALSE, message=FALSE, results='hold'}
+arc_ks = k_fit_pch(pcs4arch, ks = 2:6, check_installed = T,
+                   bootstrap = T, bootstrap_N = 200, maxiter = 1000,
+                   bootstrap_type = "s", seed = 2543, 
+                   volume_ratio = "none", # set to "none" if too slow
+                   delta=0, conv_crit = 1e-04, order_type = "align",
+                   sample_prop = 0.75)
+
+p1 <- plot_arc_var(arc_ks, type = "varexpl", point_size = 2, line_size = 1.5) + theme_bw()
+p2 <- plot_arc_var(arc_ks, type = "res_varexpl", point_size = 2, line_size = 1.5) + theme_bw()
+p3 <- plot_arc_var(arc_ks, type = "total_var", point_size = 2, line_size = 1.5) +
+  theme_bw() +
+  ylab("Mean variance in position of vertices") # look for the highest k that gives reasonably low variance
+p1
+p2
+p3
+rm(list=c("p1", "p2", "p3", "arc_ks"))
+```
+ 
+#### Fitting a line (k=2)
+```{r fit_archetypes_k2p23_ADMCI, warning=FALSE, message=FALSE}
+k=2
+arcfit <- fit_pch_bootstrap(pcs4arch, n = 200, sample_prop = 0.75, seed = 235,
+                          noc = k, delta = 0, conv_crit = 1e-04, type = "cmq")
+
+# empty points are bootstrapped data showing variance around each archetype 
+plot_arc(arc_data = arcfit, data = pcs4arch, 
+                which_dimensions = 1:3, line_size = 1.5,
+                text_size = 24, data_size = 3,
+                data_lab = labels[cases]
+                  #colors= palette(rainbow(6))
+                 ) 
+
+p_pca = plot_arc(arc_data = arcfit, data = pcs4arch, 
+                 which_dimensions = 1:2, line_size = 1.5,
+                 data_lab = labels[cases],
+                 text_size = 6, data_size = 3 
+                 )
+rm("arcfit")
+```
+
+#### Fitting a triangle (k=3)
+```{r fit_archetypes_k3p23_ADMCI, warning=FALSE, message=FALSE}
+k=3
+arcfit <- fit_pch_bootstrap(pcs4arch, n = 200, sample_prop = 0.75, seed = 235,
+                          noc = k, delta = 0, conv_crit = 1e-04, type = "cmq")
+
+# empty points are bootstrapped data showing variance around each archetype 
+plot_arc(arc_data = arcfit, data = pcs4arch, 
+                which_dimensions = 1:3, line_size = 1.5,
+                text_size = 24, data_size = 3,
+                data_lab = meta[meta$proteomicsid%in%cases, "diagnosis"]
+                  #colors= palette(rainbow(6))
+                 ) 
+
+p_pca = plot_arc(arc_data = arcfit, data = pcs4arch, 
+                 which_dimensions = 1:2, line_size = 1.5,
+                 data_lab = meta[meta$proteomicsid%in%cases, "diagnosis"],
+                 text_size = 6, data_size = 3 
+                 )
+rm("arcfit")
+```
+
+#### Fitting a rectangle (k=4)
+```{r fit_archetypes_k4p23_ADMCI, warning=FALSE, message=FALSE}
+k=4
+arcfit <- fit_pch_bootstrap(pcs4arch, n = 200, sample_prop = 0.75, seed = 235,
+                          noc = k, delta = 0, conv_crit = 1e-04, type = "cmq")
+
+# empty points are bootstrapped data showing variance around each archetype 
+plot_arc(arc_data = arcfit, data = pcs4arch, 
+                which_dimensions = 1:3, line_size = 1.5,
+                text_size = 24, data_size = 3,
+                data_lab = meta[meta$proteomicsid%in%cases, "diagnosis"]
+                  #colors= palette(rainbow(6))
+                 ) 
+
+p_pca = plot_arc(arc_data = arcfit, data = pcs4arch, 
+                 which_dimensions = 1:2, line_size = 1.5,
+                 data_lab = meta[meta$proteomicsid%in%cases, "diagnosis"],
+                 text_size = 6, data_size = 3 
+                 )
+rm("arcfit")
+```
+
+### 206 PC's (80%) {.tabset .tabset-fade .tabset-pills}
+```{r}
+p=206
+cases <- meta$proteomicsid[meta$diagnosis %in% c("AD", "MCI")]
+pcs4arch <- t(pc$x[cases,1:p])
+```
+Variance explained by different polytopes:
+```{r varianceExplained_p206_ADMCI, warning=FALSE, message=FALSE, results='hold'}
+arc_ks = k_fit_pch(pcs4arch, ks = 2:6, check_installed = T,
+                   bootstrap = T, bootstrap_N = 200, maxiter = 1000,
+                   bootstrap_type = "s", seed = 2543, 
+                   volume_ratio = "none", # set to "none" if too slow
+                   delta=0, conv_crit = 1e-04, order_type = "align",
+                   sample_prop = 0.75)
+
+p1 <- plot_arc_var(arc_ks, type = "varexpl", point_size = 2, line_size = 1.5) + theme_bw()
+p2 <- plot_arc_var(arc_ks, type = "res_varexpl", point_size = 2, line_size = 1.5) + theme_bw()
+p3 <- plot_arc_var(arc_ks, type = "total_var", point_size = 2, line_size = 1.5) +
+  theme_bw() +
+  ylab("Mean variance in position of vertices") # look for the highest k that gives reasonably low variance
+p1
+p2
+p3
+rm(list=c("p1", "p2", "p3", "arc_ks"))
+```
+ 
+#### Fitting a line (k=2)
+```{r fit_archetypes_k2p206_ADMCI, warning=FALSE, message=FALSE}
+k=2
+arcfit <- fit_pch_bootstrap(pcs4arch, n = 200, sample_prop = 0.75, seed = 235,
+                          noc = k, delta = 0, conv_crit = 1e-04, type = "cmq")
+
+# empty points are bootstrapped data showing variance around each archetype 
+plot_arc(arc_data = arcfit, data = pcs4arch, 
+                which_dimensions = 1:3, line_size = 1.5,
+                text_size = 24, data_size = 3,
+                data_lab = labels[cases]
+                  #colors= palette(rainbow(6))
+                 ) 
+
+p_pca = plot_arc(arc_data = arcfit, data = pcs4arch, 
+                 which_dimensions = 1:2, line_size = 1.5,
+                 data_lab = labels[cases],
+                 text_size = 6, data_size = 3 
+                 )
+rm("arcfit")
+```
+
+#### Fitting a triangle (k=3)
+```{r fit_archetypes_k3p206_ADMCI, warning=FALSE, message=FALSE}
+k=3
+arcfit <- fit_pch_bootstrap(pcs4arch, n = 200, sample_prop = 0.75, seed = 235,
+                          noc = k, delta = 0, conv_crit = 1e-04, type = "cmq")
+
+# empty points are bootstrapped data showing variance around each archetype 
+plot_arc(arc_data = arcfit, data = pcs4arch, 
+                which_dimensions = 1:3, line_size = 1.5,
+                text_size = 24, data_size = 3,
+                data_lab = meta[meta$proteomicsid%in%cases, "diagnosis"]
+                  #colors= palette(rainbow(6))
+                 ) 
+
+p_pca = plot_arc(arc_data = arcfit, data = pcs4arch, 
+                 which_dimensions = 1:2, line_size = 1.5,
+                 data_lab = meta[meta$proteomicsid%in%cases, "diagnosis"],
+                 text_size = 6, data_size = 3 
+                 )
+rm("arcfit")
+```
+
+#### Fitting a rectangle (k=4)
+```{r fit_archetypes_k4p206_ADMCI, warning=FALSE, message=FALSE}
+k=4
+arcfit <- fit_pch_bootstrap(pcs4arch, n = 200, sample_prop = 0.75, seed = 235,
+                          noc = k, delta = 0, conv_crit = 1e-04, type = "cmq")
+
+# empty points are bootstrapped data showing variance around each archetype 
+plot_arc(arc_data = arcfit, data = pcs4arch, 
+                which_dimensions = 1:3, line_size = 1.5,
+                text_size = 24, data_size = 3,
+                data_lab = meta[meta$proteomicsid%in%cases, "diagnosis"]
+                  #colors= palette(rainbow(6))
+                 ) 
+
+p_pca = plot_arc(arc_data = arcfit, data = pcs4arch, 
+                 which_dimensions = 1:2, line_size = 1.5,
+                 data_lab = meta[meta$proteomicsid%in%cases, "diagnosis"],
+                 text_size = 6, data_size = 3 
+                 )
+rm("arcfit")
+```
+
+## All (AD + MCI + Control) {.tabset .tabset-fade .tabset-pills}
+### 23 PC's (25%) {.tabset .tabset-fade .tabset-pills}
+```{r}
+p=23
+cases <- meta$proteomicsid[meta$diagnosis %in% c("AD", "MCI", "Control")]
+pcs4arch <- t(pc$x[cases,1:p])
+```
+Variance explained by different polytopes:
+```{r varianceExplained_p23_All, warning=FALSE, message=FALSE, results='hold'}
+arc_ks = k_fit_pch(pcs4arch, ks = 2:6, check_installed = T,
+                   bootstrap = T, bootstrap_N = 200, maxiter = 1000,
+                   bootstrap_type = "s", seed = 2543, 
+                   volume_ratio = "none", # set to "none" if too slow
+                   delta=0, conv_crit = 1e-04, order_type = "align",
+                   sample_prop = 0.75)
+
+p1 <- plot_arc_var(arc_ks, type = "varexpl", point_size = 2, line_size = 1.5) + theme_bw()
+p2 <- plot_arc_var(arc_ks, type = "res_varexpl", point_size = 2, line_size = 1.5) + theme_bw()
+p3 <- plot_arc_var(arc_ks, type = "total_var", point_size = 2, line_size = 1.5) +
+  theme_bw() +
+  ylab("Mean variance in position of vertices") # look for the highest k that gives reasonably low variance
+p1
+p2
+p3
+rm(list=c("p1", "p2", "p3", "arc_ks"))
+```
+ 
+#### Fitting a line (k=2)
+```{r fit_archetypes_k2p23_All, warning=FALSE, message=FALSE}
+k=2
+arcfit <- fit_pch_bootstrap(pcs4arch, n = 200, sample_prop = 0.75, seed = 235,
+                          noc = k, delta = 0, conv_crit = 1e-04, type = "cmq")
+
+# empty points are bootstrapped data showing variance around each archetype 
+plot_arc(arc_data = arcfit, data = pcs4arch, 
+                which_dimensions = 1:3, line_size = 1.5,
+                text_size = 24, data_size = 3,
+                data_lab = labels[cases]
+                 #colors= palette(rainbow(6))
+                ) 
+
+p_pca = plot_arc(arc_data = arcfit, data = pcs4arch, 
+                 which_dimensions = 1:2, line_size = 1.5,
+                 data_lab = labels[cases],
+                 text_size = 6, data_size = 3 
+                 )
+rm("arcfit")
+```
+
+#### Fitting a triangle (k=3)
+```{r fit_archetypes_k3p23_All, warning=FALSE, message=FALSE}
+k=3
+arcfit <- fit_pch_bootstrap(pcs4arch, n = 200, sample_prop = 0.75, seed = 235,
+                          noc = k, delta = 0, conv_crit = 1e-04, type = "cmq")
+
+# empty points are bootstrapped data showing variance around each archetype 
+plot_arc(arc_data = arcfit, data = pcs4arch, 
+                which_dimensions = 1:3, line_size = 1.5,
+                text_size = 24, data_size = 3,
+                data_lab = meta[meta$proteomicsid%in%cases, "diagnosis"]
+                  #colors= palette(rainbow(6))
+                 ) 
+
+p_pca = plot_arc(arc_data = arcfit, data = pcs4arch, 
+                 which_dimensions = 1:2, line_size = 1.5,
+                 data_lab = meta[meta$proteomicsid%in%cases, "diagnosis"],
+                 text_size = 6, data_size = 3 
+                 )
+rm("arcfit")
+```
+
+#### Fitting a rectangle (k=4)
+```{r fit_archetypes_k4p23_All, warning=FALSE, message=FALSE}
+k=4
+arcfit <- fit_pch_bootstrap(pcs4arch, n = 200, sample_prop = 0.75, seed = 235,
+                          noc = k, delta = 0, conv_crit = 1e-04, type = "cmq")
+
+# empty points are bootstrapped data showing variance around each archetype 
+plot_arc(arc_data = arcfit, data = pcs4arch, 
+                which_dimensions = 1:3, line_size = 1.5,
+                text_size = 24, data_size = 3,
+                data_lab = meta[meta$proteomicsid%in%cases, "diagnosis"]
+                  #colors= palette(rainbow(6))
+                 ) 
+
+p_pca = plot_arc(arc_data = arcfit, data = pcs4arch, 
+                 which_dimensions = 1:2, line_size = 1.5,
+                 data_lab = meta[meta$proteomicsid%in%cases, "diagnosis"],
+                 text_size = 6, data_size = 3 
+                 )
+rm("arcfit")
+```
+
+### 206 PC's (80%) {.tabset .tabset-fade .tabset-pills}
+```{r}
+p=206
+cases <- meta$proteomicsid[meta$diagnosis %in% c("AD", "MCI", "Control")]
+pcs4arch <- t(pc$x[cases,1:p])
+```
+Variance explained by different polytopes:
+```{r varianceExplained_p206_All, warning=FALSE, message=FALSE, results='hold'}
+arc_ks = k_fit_pch(pcs4arch, ks = 2:6, check_installed = T,
+                   bootstrap = T, bootstrap_N = 200, maxiter = 1000,
+                   bootstrap_type = "s", seed = 2543, 
+                   volume_ratio = "none", # set to "none" if too slow
+                   delta=0, conv_crit = 1e-04, order_type = "align",
+                   sample_prop = 0.75)
+
+p1 <- plot_arc_var(arc_ks, type = "varexpl", point_size = 2, line_size = 1.5) + theme_bw()
+p2 <- plot_arc_var(arc_ks, type = "res_varexpl", point_size = 2, line_size = 1.5) + theme_bw()
+p3 <- plot_arc_var(arc_ks, type = "total_var", point_size = 2, line_size = 1.5) +
+  theme_bw() +
+  ylab("Mean variance in position of vertices") # look for the highest k that gives reasonably low variance
+p1
+p2
+p3
+rm(list=c("p1", "p2", "p3", "arc_ks"))
+```
+ 
+#### Fitting a line (k=2)
+```{r fit_archetypes_k2p206_All, warning=FALSE, message=FALSE}
+k=2
+arcfit <- fit_pch_bootstrap(pcs4arch, n = 200, sample_prop = 0.75, seed = 235,
+                          noc = k, delta = 0, conv_crit = 1e-04, type = "cmq")
+
+# empty points are bootstrapped data showing variance around each archetype 
+plot_arc(arc_data = arcfit, data = pcs4arch, 
+                which_dimensions = 1:3, line_size = 1.5,
+                text_size = 24, data_size = 3,
+                data_lab = labels[cases]
+                 #colors= palette(rainbow(6))
+                ) 
+
+p_pca = plot_arc(arc_data = arcfit, data = pcs4arch, 
+                 which_dimensions = 1:2, line_size = 1.5,
+                 data_lab = labels[cases],
+                 text_size = 6, data_size = 3 
+                 )
+rm("arcfit")
+```
+
+#### Fitting a triangle (k=3)
+```{r fit_archetypes_k3p206_All, warning=FALSE, message=FALSE}
+k=3
+arcfit <- fit_pch_bootstrap(pcs4arch, n = 200, sample_prop = 0.75, seed = 235,
+                          noc = k, delta = 0, conv_crit = 1e-04, type = "cmq")
+
+# empty points are bootstrapped data showing variance around each archetype 
+plot_arc(arc_data = arcfit, data = pcs4arch, 
+                which_dimensions = 1:3, line_size = 1.5,
+                text_size = 24, data_size = 3,
+                data_lab = meta[meta$proteomicsid%in%cases, "diagnosis"]
+                  #colors= palette(rainbow(6))
+                 ) 
+
+p_pca = plot_arc(arc_data = arcfit, data = pcs4arch, 
+                 which_dimensions = 1:2, line_size = 1.5,
+                 data_lab = meta[meta$proteomicsid%in%cases, "diagnosis"],
+                 text_size = 6, data_size = 3 
+                 )
+rm("arcfit")
+```
+
+#### Fitting a rectangle (k=4)
+```{r fit_archetypes_k4p206_All, warning=FALSE, message=FALSE}
+k=4
+arcfit <- fit_pch_bootstrap(pcs4arch, n = 200, sample_prop = 0.75, seed = 235,
+                          noc = k, delta = 0, conv_crit = 1e-04, type = "cmq")
+
+# empty points are bootstrapped data showing variance around each archetype 
+plot_arc(arc_data = arcfit, data = pcs4arch, 
+                which_dimensions = 1:3, line_size = 1.5,
+                text_size = 24, data_size = 3,
+                data_lab = meta[meta$proteomicsid%in%cases, "diagnosis"]
+                  #colors= palette(rainbow(6))
+                 ) 
+
+p_pca = plot_arc(arc_data = arcfit, data = pcs4arch, 
+                 which_dimensions = 1:2, line_size = 1.5,
+                 data_lab = meta[meta$proteomicsid%in%cases, "diagnosis"],
+                 text_size = 6, data_size = 3 
+                 )
+rm("arcfit")
+```
+
+# Distances and classification
+Calculating Eclidean distance of each sample (including control and other) from each of the archetypes.  
+Archetype position is calculated as the mean of the bootstrapped scores around each archetype.  
+Each sample is classified to the closest archetype.  
+This infomration is added to the metadata file.
+```{r distances, warning=FALSE, message=FALSE, eval=FALSE}
+Xpca <- t(average_pch_fits(arcfit)$XC)
+rownames(Xpca) <- c("Archetype_1", "Archetype_2", "Archetype_3")
+
+allscores <- t(pc$x[,1:p])
+archetypes <- as.data.frame(matrix(NA, nr=nrow(pc$x), nc=k, 
+                dimnames=list(meta$proteomicsid, c("archetype_1","archetype_2","archetype_3"))))
+
+# calculate euclidean distances for each sample from each archetype
+for (i in 1:k) {
+  archetypes[,i] <- sqrt(colSums((allscores - Xpca[i,])^2))
+} 
+
+# classify each sample to closest archetype 
+archetypes$archetype <- apply(archetypes, 1, function(x){names(x)[x==min(x)]}) 
+archetypes$rnaseq_id <- rownames(archetypes)
+
+archmeta <- merge(meta, archetypes, by="proteomicsid")
+
+saveRDS(archmeta, file="output/proteomics/1_fit_archetypes/archetypes_meta_AD_k3p20.RDS")
+```
+
+
+
+Session info
+============
+
+```{r session-info}
+devtools::session_info()
+```

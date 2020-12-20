@@ -1,0 +1,79 @@
+---
+title: "3_architecture"
+output: html_document
+---
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+knitr::opts_knit$set(root.dir = rprojroot::find_rstudio_root_file())
+
+rm(list=ls())
+
+library(dplyr)
+library(ggplot2)
+library(data.table)
+```
+
+```{r}
+pheno <- c("archetype", "archetype_1", "archetype_2", "archetype_3")
+# Read in genes from FUMA
+loci <- c()
+for (ph in pheno) {
+    mat <- read.table(paste0("output/2b_emmax_summary/FUMA_", ph, "/genes.txt"), header=T, stringsAsFactors=F)
+    loci <- rbind(loci, cbind(mat$symbol, ph, "Subtypes"))
+}
+
+# Read in Nikhil's genes associated with clinical phenotypes and submodules, filtering out modules
+loci.NM <- read.csv("output/3_architecture/loci_NM.csv", header=T, stringsAsFactors = F)
+colnames(loci) <- colnames(loci.NM) <- c("Locus","Phenotype","Type")
+loci <- rbind(loci, loci.NM, stringsAsFactors=F) %>%
+    dplyr::filter(Type!="Modules")
+
+write.csv(loci, "output/3_architecture/loci.csv", row.names=F, quote=F)
+# loci <- read.csv("output/2b_emmax_summary/loci.csv", header=T, stringsAsFactors = F)
+
+
+# Export for Cytoscape - edge table
+# (same as loci table in this case, just different column names)
+edge.table <- as.data.frame(table(loci))
+edge.table <- edge.table %>% 
+  dplyr::filter(Freq != 0) %>%
+  dplyr::select(Source=Phenotype, Target=Locus, Type)
+write.csv(edge.table, "output/3_architecture/edge.table.csv", row.names=F, quote=F)
+
+# Export for Cytoscape - node table
+node.table <- data.frame(
+  node_name=c(unique(loci$Locus), unique(loci$Phenotype)),
+  node_type=c(rep("Locus", length(unique(loci$Locus))), rep("Phenotype", length(unique(loci$Phenotype))))
+)
+rownames(node.table) <- node.table$node_name
+
+# Add display name for phenotypes
+node.table$display_name <- ifelse(node.table$node_type=="Phenotype", as.character(node.table$node_name), NA)
+# Add display name for shared loci (except "archetype")
+tab <- dplyr::filter(edge.table, Source!="archetype")
+shared <- as.data.frame(table(tab$Target)) %>%
+  dplyr::filter(Freq > 1) %>%
+  dplyr::select(Var1)
+shared <- as.character(shared[[1]])
+node.table[shared,"display_name"] <- as.character(node.table[shared,"node_name"])
+write.csv(node.table, "output/3_architecture/node.table.csv", row.names=F, na="", quote=F)
+
+```
+Notable features of the network:
+The archetypes don't overlap at all between them (subtypes don't overlap either between A and B)
+subtype A can be broken down into loci associated with archetype 1 vs 2; consistent with exp
+subtype B overlap a lot with archetype 3; consistent with exp
+archetypes have 3 loci overlap with clinical dx vs 1 for subtypes (2 for arc3, 1 for arch2)
+arch3 connects braak and cerad with one loci
+
+Annotating the maped genes:
+```{r}
+# loci that are shared between phenotypes
+#shared.loci <- edge.table %>%
+#   filter(duplicated(edge.table$Target) | duplicated( edge.table$Target, fromLast = TRUE)) %>%
+#   arrange(Target)
+
+## GWAS catalog results from FUMA
+a1 <- read.table("output/2b_emmax_summary/FUMA_archetype_1/gwascatalog.txt", header=TRUE, sep="\t")
+
+```

@@ -1,0 +1,22 @@
+#!/bin/bash -login
+#PBS -N emmax_archetypes
+#PBS -l nodes=1:ppn=1,mem=8gb,walltime=24:00:00
+#PBS -M annat.haber@jax.org
+#PBS -m abe
+#PBS -j oe
+
+# Usage:
+# qsub -F 'output/emmax_phenotypes/archetype.pheno' scripts/emmax.pbs
+
+cd ${PBS_O_WORKDIR}
+
+# Identify the base name of the phenotype (remove .pheno)
+fname=$(basename $1)
+
+# Run EMMAX
+scripts/emmax-intel64 -v \
+  -d 10 \
+  -t data/Rosmap_allSNPjointMAF05_Clean__TRANSPOSED_EMMAX \
+  -p $1 \
+  -k data/Rosmap_allSNPjointMAF05_Clean__TRANSPOSED_EMMAX.aBN.kinf \
+  -o output/emmax/${fname}.output

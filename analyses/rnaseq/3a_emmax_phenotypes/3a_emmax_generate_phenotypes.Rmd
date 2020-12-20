@@ -1,0 +1,68 @@
+---
+title: "Generate EMMAX Phenotypes"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+knitr::opts_knit$set(root.dir = rprojroot::find_rstudio_root_file())
+
+rm(list=ls())
+
+library(dplyr)
+library(ggplot2)
+library(data.table)
+```
+
+```{r load_data}
+# Load distances from archetypes
+archetypes <- readRDS("./output/archetypes_AD_3k.RDS") %>%
+  dplyr::rename(RNA.Seq.ID=Patient)
+
+# Key for all IDs used in ROSMAP
+rosmap.ids <- read.csv("data/ROSMAP_IDkey.csv", stringsAsFactors=F, na=c("",NA))
+
+# PLINK file used to align our samples to genotypes
+tfam <- read.table("data/Rosmap_allSNPjointMAF05_Clean__TRANSPOSED_EMMAX.tfam", stringsAsFactors=F)
+colnames(tfam) <- c("Family", "WGS.ID", "X1", "X2", "X3", "X4")
+```
+
+```{r}
+# Merge with ROSMAP IDs to match with WGS IDs
+emmax.pheno <- merge(archetypes, rosmap.ids, by.x="RNA.Seq.ID", by.y="rnaseq_id", all.x=T, all.y=F) %>% 
+  dplyr::select(RNA.Seq.ID=RNA.Seq.ID, WGS.ID=wgs_id, colnames(archetypes)) %>% 
+  dplyr::filter(!is.na(WGS.ID))  %>%
+  unique
+
+# samples that were discarded when tfam was generated
+# i <- which(!emmax.pheno$WGS.ID %in% tfam$WGS.ID)
+# emmax.pheno$WGS.ID[i]
+# "SM-CJK43" "SM-CJGO1" "SM-CJGHU" "SM-CJEFR" "SM-CTEGE" "SM-CTEEB" "SM-CJJ2R" "SM-CJGGL" "SM-CTEI8"
+# "SM-CJEFV" "SM-CJFNH" "SM-CTEFA" "SM-CJEI2"
+# These are all in the list identified in WGS_PreliminaryProcessing 
+# (see /sdata/carter-lab/carter/AMPAD/Metadata/procesedFiles/Joint/DuplicatesMetadata.xls)
+# but they do not correspond to the ones marked in that file to be discarded
+# same whether unique is used on emmax.pheno or not
+
+# Align to TFAM file
+emmax.pheno <- merge(tfam, emmax.pheno, by.x="WGS.ID", by.y="WGS.ID", all.x=T) %>%
+  dplyr::select(c("WGS.ID", colnames(archetypes)))
+rownames(emmax.pheno) <- emmax.pheno$WGS.ID
+emmax.pheno <- emmax.pheno[tfam$WGS.ID,]
+emmax.pheno$archetype <- as.numeric(substring(emmax.pheno$archetype, first = 11))
+
+# samples size for emmax
+# nrow(tfam)-length(which(is.na(emmax.pheno$RNA.Seq.ID)))
+# 562
+
+# Generate the phenotype files that will act as inputs for EMMAX
+for (pheno in colnames(emmax.pheno)[2:5]) {
+  write.table(
+    cbind(emmax.pheno$WGS.ID, emmax.pheno$WGS.ID, emmax.pheno[,pheno]),
+    file=paste0("output/emmax_phenotypes/", pheno, ".pheno"),
+    quote=F, sep="\t", row.names=F, col.names=F
+  )
+}
+```
+
+emmax was run on hpc using emmax.pbs
