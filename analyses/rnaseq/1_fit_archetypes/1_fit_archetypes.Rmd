@@ -28,34 +28,36 @@ suppressPackageStartupMessages({
   library(cowplot)
   library(Matrix)
   library(tidyverse)
-  library(pins)
+  library(synapser)
 })
 
 ```
 
 # Preparing data and metadata
-Loading data downloaded directly from synapse, as well as Nikhil's subtypes, and merging it all together.  
+Loading data directly from synapse, as well as Nikhil's subtypes, and merging it all together.  
 Diagnosis variable combines cogdx, braak, and cedar scores following syn8456629  
 Dementia that isn't MCI or AD (cogdx=6) is removed so that "Other" includes only MCI.  
 Data is arranged by rnaseq_id (rows) and gene name (columns)
 ```{r load_data, warning=FALSE, message=FALSE}
+invisible(synLogin())
+
 # Nikhil's subtypes
-subtypes <- readRDS("data/milind2019/rosmap_patient_subtypes.RDS") %>% 
+subtypes <- readRDS(synGet("syn23660975")$path) %>% 
   arrange(Patient)
 rownames(subtypes) <- subtypes$Patient
 
 # Gene expression data; imputed version of syn8456719
-rna <- read_tsv("data/rna_ROSMAP_DLPFC_netResidualExpression_imputed.tsv") %>% 
+rna <- read_csv(synGet("syn23625967")$path) %>% 
   column_to_rownames("ensembl_gene_id")  %>%
   dplyr::select(as.character(subtypes$Patient)) %>%
   t()
 
 # Clinical (covariates) data syn3191087
-meta.cl <- read_csv("data/metadata/ROSMAP_clinical_2019-05_v3.csv") %>%
+meta.cl <- read_csv(synGet("syn3191087")$path) %>%
   mutate(projid=as.character(projid))
 
-# syn3382527 to match patients id's
-key <- read_csv("data/metadata/ROSMAP_IDkey.csv", col_types=cols(.default = "c")) %>% 
+# Key to match patients id's
+key <- read_csv(synGet("syn3382527")$path, col_types = cols(.default = "c")) %>% 
   dplyr::select(projid, rnaseq_id, wgs_id)  %>%
   filter(rnaseq_id %in% rownames(rna)) %>%
   filter(!duplicated(projid))
