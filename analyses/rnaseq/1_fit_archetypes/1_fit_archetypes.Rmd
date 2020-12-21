@@ -47,12 +47,12 @@ subtypes <- readRDS(synGet("syn23660975")$path) %>%
 rownames(subtypes) <- subtypes$Patient
 
 # Gene expression data; imputed version of syn8456719
-rna <- read_csv(synGet("syn23625967")$path) %>% 
+rna <- read_tsv(synGet("syn23625967")$path) %>% 
   column_to_rownames("ensembl_gene_id")  %>%
   dplyr::select(as.character(subtypes$Patient)) %>%
   t()
 
-# Clinical (covariates) data syn3191087
+# Clinical (covariates) data
 meta.cl <- read_csv(synGet("syn3191087")$path) %>%
   mutate(projid=as.character(projid))
 
@@ -961,32 +961,60 @@ archetypes_meta <- left_join(meta, archDistClass[["AD"]][["p20"]], by="rnaseq_id
     rename(Cognitive.Diagnosis=cogdx, Sex=sex, Diagnosis=diagnosis, Braak.Score=braaksc, CERAD.Score=ceradsc, APOE4=apoe_genotype)
 ```
 
-Save objects to analysis folder
+Save objects to analysis folder; K=3 p=20
 ``` {r output, cache=FALSE}
 outpath <- "analyses/rnaseq/1_fit_archetypes/"
+# output of fitting function: 
 saveRDS(arcfit_k3, file=paste0(outpath, "arcfit_k3.RDS"))
+# metadata combined with archetype classification and distances; AD only:
 saveRDS(archetypes_meta, file=paste0(outpath, "archetypes_meta_k3p20_AD.RDS"))
+# PCA results from all individuals as well as AD only:
 saveRDS(list(arch.pca=arch.pca, all.pca=pc), file=paste0(outpath, "archetypes_pca_k3p20_AD.RDS"))
+# Original gene expression data of all samples and recostructed data for archetypes:
 saveRDS(arch.ge, file=paste0(outpath, "archetypes_ge_k3p20_AD.RDS"))
+# Top genes associated with each archetype along with their LogFC (relative to other archetypes):
 saveRDS(topgenes, file=paste0(outpath, "topgenes_logFC_k3p20_AD.RDS"))
+# limma results for all genes
 saveRDS(lm.res, file=paste0(outpath, "logFC_allres_k3p20_AD.RDS"))
 ```
 
-Pin objects to local board (cache)
-```{r}
-pin(archetypes_meta, 
-    name = "archetypes_meta_k3p20_AD", 
-    description = "Archetype classification and distance. Output of ampad_archetypes/analyses/rnaseq/1_fit_archetypes",
-    board = "local")
-```
+```{r syn_output, eval=FALSE}
+invisible(synLogin())
 
-Pin objects to RStudio Connect
-```{r}
-board_register_rsconnect("rsconnect", server = "https://rshiny.jax.org")
-pin(archetypes_meta, 
-    name = "archetypes_meta_k3p20_AD", 
-    description = "Archetype classification and distance. Output of ampad_archetypes/analyses/rnaseq/1_fit_archetypes",
-    board = "rsconnect")
+file <- File("analyses/rnaseq/1_fit_archetypes/1_fit_archetypes.Rmd",
+             description = "Analysis script",
+             parent = "syn23660991",
+             dataFileHandleId = "syn23662137")
+prov <- Activity(used = c('syn23660975', 'syn23625967', 'syn3191087', 'syn3382527'))
+file <- synStore(file, activity=prov)
+
+file <- File("analyses/rnaseq/1_fit_archetypes/archetypes_ge_k3p20_AD.RDS",
+             description = "Original gene expression data of all samples and recostructed data for archetypes",
+             parent = "syn23660991",
+             dataFileHandleId = "syn23662133")
+prov <- Activity(executed = "syn23662137")
+file <- synStore(file, activity=prov)
+
+file <- File("analyses/rnaseq/1_fit_archetypes/archetypes_meta_k3p20_AD.RDS", 
+             description = "metadata combined with archetype classification and distances; AD only",
+             parent = "syn23660991",
+             dataFileHandleId = "syn23662134")
+prov <- Activity(executed = "syn23662137")
+file <- synStore(file, activity=prov)
+
+file <- File("analyses/rnaseq/1_fit_archetypes/topgenes_logFC_k3p20_AD.RDS", 
+             description = "Top genes associated with each archetype along with their LogFC relative to other archetypes",
+             parent = "syn23660991",
+             dataFileHandleId = "syn23662135")
+prov <- Activity(executed = "syn23662137")
+file <- synStore(file, activity=prov)
+
+file <- File("analyses/rnaseq/1_fit_archetypes/logFC_allres_k3p20_AD.RDS", 
+             description = "limma results for all genes",
+             parent = "syn23660991",
+             dataFileHandleId = "syn23662136")
+prov <- Activity(executed = "syn23662137")
+file <- synStore(file, activity=prov)
 ```
 
 # Session info
