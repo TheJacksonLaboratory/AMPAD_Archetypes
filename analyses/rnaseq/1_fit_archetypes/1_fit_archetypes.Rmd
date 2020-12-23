@@ -978,6 +978,7 @@ saveRDS(topgenes, file=paste0(outpath, "topgenes_logFC_k3p20_AD.RDS"))
 saveRDS(lm.res, file=paste0(outpath, "logFC_allres_k3p20_AD.RDS"))
 ```
 
+Update Synapse
 ```{r syn_output, eval=FALSE}
 invisible(synLogin())
 
