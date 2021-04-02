@@ -7,6 +7,8 @@
 *.csv
 *.tsv
 *.txt
+*.jpg
+*.pheno
 *.ps
 *.log
 *.reml
